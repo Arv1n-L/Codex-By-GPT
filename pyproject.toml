@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-by-gpt"
+version = "0.1.0"
+description = "One machine, one Secure MCP Tunnel, one C2C Gateway, N workspaces"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+[project.scripts]
+c2c = "codex_by_gpt.cli:main"
+
+[tool.setuptools]
+packages = ["codex_by_gpt"]

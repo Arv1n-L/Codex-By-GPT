@@ -11,6 +11,7 @@ from pathlib import Path
 from .config import add_workspace, get_workspace, list_workspaces, remove_workspace
 from .mailbox import ack, list_results
 from .mcp import serve
+from .worker import listen
 
 
 def emit(data):
@@ -35,6 +36,12 @@ def build_parser() -> argparse.ArgumentParser:
     mbs = mb.add_subparsers(dest="action", required=True)
     ls = mbs.add_parser("list"); ls.add_argument("--workspace"); ls.add_argument("--task"); ls.add_argument("--all", action="store_true")
     ak = mbs.add_parser("ack"); ak.add_argument("result_id")
+    codex = sub.add_parser("codex")
+    codexs = codex.add_subparsers(dest="action", required=True)
+    listen_p = codexs.add_parser("listen")
+    listen_p.add_argument("--workspace", required=True)
+    listen_p.add_argument("--poll-interval", type=float, default=1.0)
+    listen_p.add_argument("--once", action="store_true")
     tun = sub.add_parser("tunnel")
     tuns = tun.add_subparsers(dest="action", required=True)
     init = tuns.add_parser("init-command"); init.add_argument("--tunnel-id", required=True); init.add_argument("--profile", default="codex-by-gpt"); init.add_argument("--port", type=int, default=8765)
@@ -55,6 +62,10 @@ def main(argv=None) -> int:
     if args.cmd == "mailbox":
         if args.action == "list": emit(list_results(args.workspace, args.task, args.all)); return 0
         if args.action == "ack": emit({"acked": ack(args.result_id)}); return 0
+    if args.cmd == "codex" and args.action == "listen":
+        cfg = get_workspace(args.workspace)
+        listen(cfg, args.poll_interval, args.once)
+        return 0
     if args.cmd == "tunnel":
         if args.action == "init-command":
             emit({"env": "CONTROL_PLANE_API_KEY=<runtime-key>", "command": f'tunnel-client init --sample sample_mcp_stdio_local --profile {args.profile} --tunnel-id {args.tunnel_id} --mcp-server-url http://127.0.0.1:{args.port}/mcp', "then": f"tunnel-client doctor --profile {args.profile} --explain"}); return 0

@@ -19,3 +19,25 @@ The Gateway binds to loopback. OpenAI Secure MCP Tunnel is the remote transport 
 ## Execution
 
 Codex is the executor. It remains responsible for file edits, shell commands, tests and Git mutation. ChatGPT is planner/reviewer/researcher and consumes evidence through MCP.
+
+## Execution loop
+
+The v0.2.0 listener processes only unacknowledged `PLAN` and `REVIEW` mailbox
+records for one explicitly selected registered workspace. It fixes the Codex
+working directory to that workspace root, records bounded stdout/stderr and a
+schema-constrained test status in `executions.jsonl`, and acknowledges the
+source result only after the execution record is durable.
+
+Starting a workspace listener authorizes `PLAN` and `REVIEW` messages to trigger
+Codex execution within that registered root. Mailbox read-modify-write
+transactions are serialized across local processes, and all model-visible
+execution output and test-status text is secret-redacted before it is persisted
+or exposed through MCP.
+
+`EXECUTED` is not an accepted `submit_result` kind, so ChatGPT cannot fabricate
+executor evidence. ChatGPT reads it through the read-only `wait_execution` MCP
+tool and cross-checks it against workspace files and Git state.
+
+The wait tool uses a bounded long poll. It does not actively wake an ended
+ChatGPT turn and does not introduce an external callback, queue, database, or
+service manager.

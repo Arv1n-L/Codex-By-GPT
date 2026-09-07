@@ -10,6 +10,7 @@ from typing import Any
 APP_DIR = Path(os.environ.get("C2C_HOME", Path.home() / ".codex-by-gpt"))
 STATE_FILE = APP_DIR / "machine.json"
 MAILBOX_FILE = APP_DIR / "mailbox.jsonl"
+EXECUTIONS_FILE = APP_DIR / "executions.jsonl"
 
 @dataclass(frozen=True)
 class WorkspaceConfig:

@@ -22,6 +22,7 @@ C2C Gateway (127.0.0.1:8765/mcp)
 
 ChatGPT --submit_result--> bounded local mailbox --> Codex
 Codex   --files/shell/git/tests--> workspace
+Codex   --EXECUTED evidence--> local execution store --> ChatGPT
 ```
 
 The Gateway never exposes arbitrary shell or filesystem writes to ChatGPT. `submit_result` can only append a typed result (`PLAN`, `REVIEW`, `DONE`, `BLOCKED`, `RESEARCH`) to the local C2C mailbox.
@@ -122,6 +123,40 @@ Codex:   c2c mailbox list --workspace <workspace_id> --task <task_id>
 Codex:   c2c mailbox ack <result_id>
 ```
 
+## Run the C2C execution loop
+
+Start one listener for the workspace that Codex is allowed to execute in:
+
+```sh
+c2c codex listen --workspace factory-Agent
+```
+
+The listener processes unacknowledged `PLAN` and `REVIEW` results in order. It
+runs Codex with the registered workspace root as its fixed working directory,
+stores bounded, secret-redacted JSONL execution evidence under the machine state directory, and
+only then acknowledges the source mailbox result. `DONE`, `BLOCKED`, and
+`RESEARCH` remain non-executable messages.
+
+Starting the listener explicitly authorizes submitted `PLAN` and `REVIEW`
+messages to trigger Codex execution inside that registered workspace. Mailbox
+mutations are serialized with a machine-local cross-process lock.
+
+ChatGPT can wait for the corresponding result with the read-only MCP tool:
+
+```text
+wait_execution(workspace_id, task_id, iteration, timeout_seconds=30)
+```
+
+The tool returns `PENDING` or an `EXECUTED` record containing the Codex exit
+code, bounded and redacted execution output, and a bounded, redacted structured
+test status. ChatGPT should then
+independently inspect `git_diff`, `git_status`, and relevant files before
+submitting `REVIEW` or `DONE`.
+
+This is bounded long-polling, not an active callback that wakes an ended
+ChatGPT turn. The listener is an explicit foreground process in v0.2.0; service
+installation and multi-worker leases remain outside this release.
+
 ## Security boundary
 
 ChatGPT does **not** receive tools for:
@@ -136,4 +171,7 @@ The Gateway rejects `..` path escapes, skips high-noise/private directories, and
 
 ## Status
 
-This is a clean machine-wide foundation designed for the V2 topology. The next production-hardening layer should add OS service installation (systemd/Windows Service), short-lived per-session capabilities, session/page leases, and richer execution evidence records without expanding ChatGPT's workspace write permissions.
+v0.2.0 adds the minimum PLAN/REVIEW → Codex → EXECUTED evidence loop without
+expanding ChatGPT's workspace permissions. The next production-hardening layer
+may add OS service installation, short-lived per-session capabilities, and
+multi-worker leases.

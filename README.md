@@ -115,13 +115,21 @@ Bounded control plane:
 
 - `submit_result`
 
+Read-only execution evidence:
+
+- `wait_execution`
+
 Example mailbox workflow:
 
 ```text
 ChatGPT: submit_result(workspace_id, task_id, iteration, kind="PLAN", payload="...")
 Codex:   c2c mailbox list --workspace <workspace_id> --task <task_id>
-Codex:   c2c mailbox ack <result_id>
+Codex:   c2c codex listen --workspace <workspace_id>
 ```
+
+The listener owns acknowledgement for executable `PLAN` and `REVIEW` rows.
+Use manual `c2c mailbox ack` only to dismiss a non-executable mailbox message,
+not while an execution claim is outstanding.
 
 ## Run the C2C execution loop
 
@@ -136,6 +144,26 @@ runs Codex with the registered workspace root as its fixed working directory,
 stores bounded, secret-redacted JSONL execution evidence under the machine state directory, and
 only then acknowledges the source mailbox result. `DONE`, `BLOCKED`, and
 `RESEARCH` remain non-executable messages.
+
+Before Codex starts, the listener durably claims the logical task iteration.
+The normal order is claim, run Codex, persist terminal execution evidence,
+clear the claim, then acknowledge the mailbox result. If a listener restarts
+with a claim but no terminal execution, it does not automatically rerun
+potentially mutating instructions. Instead it records `EXECUTED` evidence with
+an unknown outcome so ChatGPT or the operator can inspect the workspace and
+continue with a new iteration. This conservative recovery may also suppress a
+safe retry if the listener stopped after claiming but before Codex started.
+The listener sweeps claims before the unacknowledged mailbox queue, so recovery
+still produces terminal evidence if the source row was already acknowledged.
+
+`task_id` plus `iteration` identifies one logical C2C step. An exact network
+retry reuses the original mailbox result, including after acknowledgement;
+changed instructions must use the next iteration and otherwise fail closed.
+The worker also skips legacy duplicate rows after one logical execution exists.
+The execution store independently enforces the same logical task-iteration
+uniqueness, even when source mailbox IDs differ.
+This idempotency guarantee assumes the documented single-listener model; it is
+not multi-worker coordination.
 
 Starting the listener explicitly authorizes submitted `PLAN` and `REVIEW`
 messages to trigger Codex execution inside that registered workspace. Mailbox
@@ -171,7 +199,8 @@ The Gateway rejects `..` path escapes, skips high-noise/private directories, and
 
 ## Status
 
-v0.2.0 adds the minimum PLAN/REVIEW → Codex → EXECUTED evidence loop without
-expanding ChatGPT's workspace permissions. The next production-hardening layer
+v0.2.1 adds task-iteration idempotency and a durable execution claim so
+transport retries or listener restarts cannot automatically execute the same
+logical step twice under the single-listener model. The next production-hardening layer
 may add OS service installation, short-lived per-session capabilities, and
 multi-worker leases.

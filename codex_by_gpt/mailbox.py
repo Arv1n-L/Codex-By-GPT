@@ -11,7 +11,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Iterator
 
-from .config import APP_DIR, EXECUTIONS_FILE, MAILBOX_FILE
+from .config import APP_DIR, EXECUTION_CLAIMS_FILE, EXECUTIONS_FILE, MAILBOX_FILE
 
 ALLOWED_KINDS = {"PLAN", "REVIEW", "DONE", "BLOCKED", "RESEARCH"}
 MAX_PAYLOAD_CHARS = 64_000
@@ -54,6 +54,23 @@ class ExecutionRecord:
     execution_output: str
     test_status: dict[str, Any]
     created_at: float
+
+
+@dataclass
+class ExecutionClaim:
+    workspace_id: str
+    task_id: str
+    iteration: int
+    source_result_id: str
+    created_at: float
+
+
+class SubmissionConflictError(ValueError):
+    """A logical task iteration was resubmitted with different content."""
+
+
+def _logical_key(row: dict[str, Any]) -> tuple[str, str, int]:
+    return (row["workspace_id"], row["task_id"], int(row["iteration"]))
 
 
 @contextmanager
@@ -127,9 +144,17 @@ def submit(workspace_id: str, task_id: str, iteration: int, kind: str, payload: 
         raise ValueError("iteration must be >= 0")
     if len(payload) > MAX_PAYLOAD_CHARS:
         raise ValueError("payload too large")
-    result = Result(str(uuid.uuid4()), workspace_id, task_id, iteration, kind, payload, time.time())
     with _locked(MAILBOX_FILE):
         rows = _load()
+        key = (workspace_id, task_id, iteration)
+        matches = [row for row in rows if _logical_key(row) == key]
+        if matches:
+            if all(row["kind"] == kind and row["payload"] == payload for row in matches):
+                return Result(**matches[0])
+            raise SubmissionConflictError(
+                "task_id and iteration already contain different content; use a new iteration"
+            )
+        result = Result(str(uuid.uuid4()), workspace_id, task_id, iteration, kind, payload, time.time())
         rows.append(asdict(result))
         _save(rows)
     return result
@@ -173,6 +198,68 @@ def _save_executions(rows: list[dict[str, Any]]) -> None:
     os.replace(tmp, EXECUTIONS_FILE)
 
 
+def _load_execution_claims() -> list[dict[str, Any]]:
+    if not EXECUTION_CLAIMS_FILE.exists():
+        return []
+    rows = []
+    for line in EXECUTION_CLAIMS_FILE.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
+def _save_execution_claims(rows: list[dict[str, Any]]) -> None:
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = EXECUTION_CLAIMS_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    os.replace(tmp, EXECUTION_CLAIMS_FILE)
+
+
+def get_execution_claim(workspace_id: str, task_id: str, iteration: int) -> dict[str, Any] | None:
+    key = (workspace_id, task_id, iteration)
+    return next((row for row in reversed(_load_execution_claims()) if _logical_key(row) == key), None)
+
+
+def list_execution_claims(workspace_id: str | None = None) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in _load_execution_claims()
+        if workspace_id is None or row["workspace_id"] == workspace_id
+    ]
+
+
+def claim_execution(workspace_id: str, task_id: str, iteration: int, source_result_id: str) -> ExecutionClaim:
+    if iteration < 0:
+        raise ValueError("iteration must be >= 0")
+    if not source_result_id:
+        raise ValueError("source_result_id is required")
+    with _locked(EXECUTION_CLAIMS_FILE):
+        rows = _load_execution_claims()
+        key = (workspace_id, task_id, iteration)
+        existing = next((row for row in reversed(rows) if _logical_key(row) == key), None)
+        if existing:
+            if existing["source_result_id"] != source_result_id:
+                raise RuntimeError("logical task iteration is already claimed by a different mailbox result")
+            return ExecutionClaim(**existing)
+        claim = ExecutionClaim(workspace_id, task_id, iteration, source_result_id, time.time())
+        rows.append(asdict(claim))
+        _save_execution_claims(rows)
+    return claim
+
+
+def clear_execution_claim(workspace_id: str, task_id: str, iteration: int) -> bool:
+    with _locked(EXECUTION_CLAIMS_FILE):
+        rows = _load_execution_claims()
+        key = (workspace_id, task_id, iteration)
+        kept = [row for row in rows if _logical_key(row) != key]
+        if len(kept) == len(rows):
+            return False
+        _save_execution_claims(kept)
+    return True
+
+
 def _normalize_test_status(value: dict[str, Any] | None) -> dict[str, Any]:
     value = value if isinstance(value, dict) else {}
     status = value.get("status")
@@ -206,7 +293,10 @@ def record_execution(
         raise ValueError("source_result_id is required")
     with _locked(EXECUTIONS_FILE):
         rows = _load_executions()
-        existing = next((row for row in reversed(rows) if row["source_result_id"] == source_result_id), None)
+        key = (workspace_id, task_id, iteration)
+        existing = next((row for row in reversed(rows) if _logical_key(row) == key), None)
+        if not existing:
+            existing = next((row for row in reversed(rows) if row["source_result_id"] == source_result_id), None)
         if existing:
             return ExecutionRecord(**existing)
         clipped_output = _redact_execution_output(str(execution_output))[:MAX_EXECUTION_OUTPUT_CHARS]

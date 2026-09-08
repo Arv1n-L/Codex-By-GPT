@@ -12,6 +12,10 @@ Workspace tools are read-only and operate inside the selected registered root. P
 
 `submit_result` is intentionally the only write-capable MCP tool. Its write target is not a workspace: it is the Gateway mailbox. Payload size and result kind are bounded.
 
+`(workspace_id, task_id, iteration)` identifies one logical submission. Exact
+retries return the original result, including after acknowledgement; a changed
+kind or payload for the same key fails closed and must use a higher iteration.
+
 ## Transport
 
 The Gateway binds to loopback. OpenAI Secure MCP Tunnel is the remote transport and initiates outbound HTTPS to OpenAI. No public inbound MCP URL is required.
@@ -27,6 +31,34 @@ records for one explicitly selected registered workspace. It fixes the Codex
 working directory to that workspace root, records bounded stdout/stderr and a
 schema-constrained test status in `executions.jsonl`, and acknowledges the
 source result only after the execution record is durable.
+
+The single-listener execution lifecycle is:
+
+```text
+durable claim -> run Codex -> durable terminal execution -> clear claim -> ack source
+```
+
+Claims are internal JSONL machine state keyed by
+`(workspace_id, task_id, iteration)`. A claim that survives without a terminal
+execution means the prior listener may have stopped after Codex began mutating
+the workspace. Recovery therefore fails closed: it does not rerun Codex, but
+persists terminal `EXECUTED` evidence with an unknown outcome, clears the claim,
+and acknowledges the source. A terminal execution plus a leftover claim is
+cleaned up and acknowledged without rerunning. This deliberately prefers a
+possible false interruption over duplicate workspace mutation.
+
+Each listener pass sweeps claims for its registered workspace before reading
+the unacknowledged mailbox queue. Claim recovery therefore does not depend on
+the source row still being unacknowledged; a prematurely acknowledged source
+cannot strand the logical iteration in `PENDING`. Manual acknowledgement is
+reserved for non-executable messages because the listener owns acknowledgement
+of `PLAN` and `REVIEW` rows.
+
+Before running Codex, the worker also checks for an existing execution with the
+same logical key. This prevents pre-v0.2.1 duplicate mailbox rows from causing
+a second execution; it is defense-in-depth for the single-listener model, not a
+multi-worker lease. The execution store also reuses an existing terminal row
+for that logical key even when a legacy duplicate has a different source ID.
 
 Starting a workspace listener authorizes `PLAN` and `REVIEW` messages to trigger
 Codex execution within that registered root. Mailbox read-modify-write

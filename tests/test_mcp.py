@@ -1,5 +1,6 @@
 from __future__ import annotations
 import importlib
+import json
 import os
 import tempfile
 import unittest
@@ -51,3 +52,14 @@ class McpTest(unittest.TestCase):
     def test_chatgpt_cannot_submit_executed(self):
         result = self.mcp.call_tool("submit_result", {"workspace_id": self.ws.id, "task_id": "task-1", "iteration": 1, "kind": "EXECUTED", "payload": "fake"})
         self.assertTrue(result["isError"])
+
+    def test_submit_result_is_idempotent_and_rejects_conflicts(self):
+        args = {"workspace_id": self.ws.id, "task_id": "task-retry", "iteration": 1, "kind": "PLAN", "payload": "same"}
+        first = self.mcp.call_tool("submit_result", args)
+        retry = self.mcp.call_tool("submit_result", args)
+        first_data = json.loads(first["content"][0]["text"])
+        retry_data = json.loads(retry["content"][0]["text"])
+        self.assertEqual(first_data["resultId"], retry_data["resultId"])
+        conflict = self.mcp.call_tool("submit_result", {**args, "payload": "changed"})
+        self.assertTrue(conflict["isError"])
+        self.assertIn("new iteration", conflict["content"][0]["text"])

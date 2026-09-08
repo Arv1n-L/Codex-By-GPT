@@ -10,10 +10,25 @@ from pathlib import Path
 from typing import Callable
 
 from .config import APP_DIR, WorkspaceConfig
-from .mailbox import ack, execution_for_source, list_results, record_execution
+from .mailbox import (
+    ack,
+    claim_execution,
+    clear_execution_claim,
+    execution_for_source,
+    get_execution,
+    get_execution_claim,
+    list_execution_claims,
+    list_results,
+    record_execution,
+)
 
 ACTIONABLE_KINDS = {"PLAN", "REVIEW"}
 CODEX_TIMEOUT_SECONDS = 2 * 60 * 60
+INTERRUPTED_OUTPUT = (
+    "A prior listener stopped after durably claiming this task iteration. "
+    "Automatic rerun was suppressed because the workspace may already contain partial changes."
+)
+INTERRUPTED_TEST_SUMMARY = "Execution outcome is unknown; inspect the workspace before using the next iteration."
 
 
 @dataclass
@@ -116,15 +131,60 @@ def run_codex(cfg: WorkspaceConfig, result: dict[str, object]) -> ExecutionOutco
 Runner = Callable[[WorkspaceConfig, dict[str, object]], ExecutionOutcome]
 
 
+def _recover_next_claim(cfg: WorkspaceConfig) -> bool:
+    for claim in list_execution_claims(cfg.id):
+        iteration = int(claim["iteration"])
+        existing = get_execution(cfg.id, claim["task_id"], iteration)
+        if not existing:
+            record_execution(
+                workspace_id=cfg.id,
+                task_id=claim["task_id"],
+                iteration=iteration,
+                source_result_id=claim["source_result_id"],
+                codex_exit_code=None,
+                execution_output=INTERRUPTED_OUTPUT,
+                test_status={"status": "unknown", "command": None, "summary": INTERRUPTED_TEST_SUMMARY},
+            )
+        clear_execution_claim(cfg.id, claim["task_id"], iteration)
+        ack(claim["source_result_id"])
+        return True
+    return False
+
+
 def process_next(cfg: WorkspaceConfig, runner: Runner = run_codex) -> bool:
+    if _recover_next_claim(cfg):
+        return True
     for result in list_results(cfg.id):
         if result["kind"] not in ACTIONABLE_KINDS:
             continue
         existing = execution_for_source(result["id"])
         if existing:
+            clear_execution_claim(cfg.id, result["task_id"], int(result["iteration"]))
             if not ack(result["id"]):
                 raise RuntimeError(f"Could not acknowledge mailbox result {result['id']}")
             return True
+        logical_execution = get_execution(cfg.id, result["task_id"], int(result["iteration"]))
+        if logical_execution:
+            clear_execution_claim(cfg.id, result["task_id"], int(result["iteration"]))
+            if not ack(result["id"]):
+                raise RuntimeError(f"Could not acknowledge duplicate mailbox result {result['id']}")
+            return True
+        existing_claim = get_execution_claim(cfg.id, result["task_id"], int(result["iteration"]))
+        if existing_claim:
+            record_execution(
+                workspace_id=cfg.id,
+                task_id=result["task_id"],
+                iteration=int(result["iteration"]),
+                source_result_id=existing_claim["source_result_id"],
+                codex_exit_code=None,
+                execution_output=INTERRUPTED_OUTPUT,
+                test_status={"status": "unknown", "command": None, "summary": INTERRUPTED_TEST_SUMMARY},
+            )
+            clear_execution_claim(cfg.id, result["task_id"], int(result["iteration"]))
+            if not ack(result["id"]):
+                raise RuntimeError(f"Could not acknowledge interrupted mailbox result {result['id']}")
+            return True
+        claim_execution(cfg.id, result["task_id"], int(result["iteration"]), result["id"])
         outcome = runner(cfg, result)
         record_execution(
             workspace_id=cfg.id,
@@ -135,6 +195,7 @@ def process_next(cfg: WorkspaceConfig, runner: Runner = run_codex) -> bool:
             execution_output=outcome.output,
             test_status=outcome.test_status,
         )
+        clear_execution_claim(cfg.id, result["task_id"], int(result["iteration"]))
         if not ack(result["id"]):
             raise RuntimeError(f"Could not acknowledge mailbox result {result['id']}")
         return True

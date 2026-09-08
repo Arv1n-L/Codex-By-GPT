@@ -36,6 +36,55 @@ class GatewayTest(unittest.TestCase):
         self.assertTrue(self.mailbox.ack(result.id))
         self.assertEqual(self.mailbox.list_results(ws.id, "task-1"), [])
 
+    def test_exact_retry_reuses_original_result_even_after_ack(self):
+        root = Path(self.tmp.name) / "a"; root.mkdir()
+        ws = self.config.add_workspace(str(root))
+        first = self.mailbox.submit(ws.id, "task-retry", 1, "PLAN", "same")
+        retry = self.mailbox.submit(ws.id, "task-retry", 1, "PLAN", "same")
+        self.assertEqual(retry.id, first.id)
+        self.assertEqual(retry.created_at, first.created_at)
+        self.assertEqual(len(self.mailbox.list_results(ws.id, "task-retry", include_acked=True)), 1)
+        self.assertTrue(self.mailbox.ack(first.id))
+        acked_retry = self.mailbox.submit(ws.id, "task-retry", 1, "PLAN", "same")
+        self.assertEqual(acked_retry.id, first.id)
+        self.assertTrue(acked_retry.acked)
+        self.assertEqual(self.mailbox.list_results(ws.id, "task-retry"), [])
+
+    def test_conflicting_retry_is_rejected_without_append(self):
+        root = Path(self.tmp.name) / "a"; root.mkdir()
+        ws = self.config.add_workspace(str(root))
+        self.mailbox.submit(ws.id, "task-conflict", 1, "PLAN", "original")
+        with self.assertRaisesRegex(self.mailbox.SubmissionConflictError, "new iteration"):
+            self.mailbox.submit(ws.id, "task-conflict", 1, "PLAN", "changed")
+        with self.assertRaisesRegex(self.mailbox.SubmissionConflictError, "new iteration"):
+            self.mailbox.submit(ws.id, "task-conflict", 1, "REVIEW", "original")
+        self.assertEqual(len(self.mailbox.list_results(ws.id, "task-conflict", include_acked=True)), 1)
+
+    def test_concurrent_identical_submissions_create_one_row(self):
+        root = Path(self.tmp.name) / "a"; root.mkdir()
+        ws = self.config.add_workspace(str(root))
+        start = threading.Barrier(3)
+        ids = []
+        errors = []
+
+        def submit_once():
+            try:
+                start.wait()
+                ids.append(self.mailbox.submit(ws.id, "task-concurrent", 1, "PLAN", "same").id)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=submit_once) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        for thread in threads:
+            thread.join(2)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(ids)), 1)
+        self.assertEqual(len(self.mailbox.list_results(ws.id, "task-concurrent", include_acked=True)), 1)
+
     def test_execution_record_is_separate_bounded_and_idempotent(self):
         root = Path(self.tmp.name) / "a"; root.mkdir()
         ws = self.config.add_workspace(str(root))
@@ -65,6 +114,35 @@ class GatewayTest(unittest.TestCase):
             {"status": "passed", "command": "tests", "summary": "claimed pass"},
         )
         self.assertEqual(failed.test_status["status"], "unknown")
+
+    def test_execution_claim_is_durable_idempotent_and_clearable(self):
+        root = Path(self.tmp.name) / "a"; root.mkdir()
+        ws = self.config.add_workspace(str(root))
+        first = self.mailbox.claim_execution(ws.id, "task-claim", 1, "source-1")
+        retry = self.mailbox.claim_execution(ws.id, "task-claim", 1, "source-1")
+        self.assertEqual(retry.created_at, first.created_at)
+        self.assertEqual(
+            self.mailbox.get_execution_claim(ws.id, "task-claim", 1)["source_result_id"],
+            "source-1",
+        )
+        with self.assertRaisesRegex(RuntimeError, "different mailbox result"):
+            self.mailbox.claim_execution(ws.id, "task-claim", 1, "source-2")
+        self.assertTrue(self.mailbox.clear_execution_claim(ws.id, "task-claim", 1))
+        self.assertIsNone(self.mailbox.get_execution_claim(ws.id, "task-claim", 1))
+        self.assertFalse(self.mailbox.clear_execution_claim(ws.id, "task-claim", 1))
+
+    def test_execution_record_deduplicates_by_logical_iteration(self):
+        root = Path(self.tmp.name) / "a"; root.mkdir()
+        ws = self.config.add_workspace(str(root))
+        first = self.mailbox.record_execution(
+            ws.id, "task-logical", 4, "source-1", 0, "first", {"status": "passed"}
+        )
+        duplicate = self.mailbox.record_execution(
+            ws.id, "task-logical", 4, "source-2", 1, "second", {"status": "failed"}
+        )
+        self.assertEqual(duplicate.id, first.id)
+        self.assertEqual(duplicate.source_result_id, "source-1")
+        self.assertEqual(len(self.mailbox._load_executions()), 1)
 
     def test_mailbox_submit_and_ack_are_serialized(self):
         root = Path(self.tmp.name) / "a"; root.mkdir()

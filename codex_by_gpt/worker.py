@@ -7,7 +7,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from .config import APP_DIR, WorkspaceConfig
 from .mailbox import (
@@ -21,6 +21,7 @@ from .mailbox import (
     list_results,
     record_execution,
 )
+from .runtime import listener_ownership
 
 ACTIONABLE_KINDS = {"PLAN", "REVIEW"}
 CODEX_TIMEOUT_SECONDS = 2 * 60 * 60
@@ -202,12 +203,26 @@ def process_next(cfg: WorkspaceConfig, runner: Runner = run_codex) -> bool:
     return False
 
 
-def listen(cfg: WorkspaceConfig, poll_interval: float = 1.0, once: bool = False, runner: Runner = run_codex) -> None:
+def listen(
+    configs: WorkspaceConfig | Sequence[WorkspaceConfig],
+    poll_interval: float = 1.0,
+    once: bool = False,
+    runner: Runner = run_codex,
+) -> None:
     if poll_interval <= 0:
         raise ValueError("poll_interval must be > 0")
-    while True:
-        processed = process_next(cfg, runner)
-        if once:
-            return
-        if not processed:
-            time.sleep(poll_interval)
+    selected = [configs] if isinstance(configs, WorkspaceConfig) else list(configs)
+    cursor = 0
+    with listener_ownership(selected):
+        while True:
+            processed = False
+            for offset in range(len(selected)):
+                index = (cursor + offset) % len(selected)
+                if process_next(selected[index], runner):
+                    cursor = (index + 1) % len(selected)
+                    processed = True
+                    break
+            if once:
+                return
+            if not processed:
+                time.sleep(poll_interval)

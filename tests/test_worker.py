@@ -14,9 +14,11 @@ class WorkerTest(unittest.TestCase):
         os.environ["C2C_HOME"] = str(Path(self.tmp.name) / "state")
         import codex_by_gpt.config as config
         import codex_by_gpt.mailbox as mailbox
+        import codex_by_gpt.runtime as runtime
         import codex_by_gpt.worker as worker
         importlib.reload(config)
         importlib.reload(mailbox)
+        importlib.reload(runtime)
         importlib.reload(worker)
         self.config, self.mailbox, self.worker = config, mailbox, worker
         root = Path(self.tmp.name) / "repo"; root.mkdir()
@@ -212,6 +214,41 @@ class WorkerTest(unittest.TestCase):
             malformed = self.worker.run_codex(self.ws, result)
         self.assertEqual(malformed.exit_code, 3)
         self.assertEqual(malformed.test_status["status"], "unknown")
+
+    def test_multi_workspace_listener_dispatches_one_explicit_workspace(self):
+        other_root = Path(self.tmp.name) / "other"
+        other_root.mkdir()
+        other = self.config.add_workspace(str(other_root), "other")
+        source = self.mailbox.submit(other.id, "task-multi", 1, "PLAN", "do it")
+        calls = []
+
+        def fake_runner(cfg, result):
+            calls.append((cfg.id, result["id"]))
+            return self.worker.ExecutionOutcome(
+                0, "done", {"status": "passed", "command": "tests", "summary": "ok"}
+            )
+
+        self.worker.listen([self.ws, other], poll_interval=0.01, once=True, runner=fake_runner)
+
+        self.assertEqual(calls, [(other.id, source.id)])
+        self.assertEqual(self.mailbox.list_results(other.id, "task-multi"), [])
+
+    def test_listener_ownership_blocks_runner_for_duplicate_workspace(self):
+        import codex_by_gpt.runtime as runtime
+
+        source = self.mailbox.submit(self.ws.id, "task-locked", 1, "PLAN", "do it")
+        runner = mock.Mock()
+        with runtime.ListenerLock(self.ws):
+            with self.assertRaises(runtime.ListenerAlreadyActiveError):
+                self.worker.listen(self.ws, poll_interval=0.01, once=True, runner=runner)
+        runner.assert_not_called()
+        self.assertEqual(self.mailbox.list_results(self.ws.id, "task-locked")[0]["id"], source.id)
+
+    def test_multi_workspace_listener_rejects_duplicate_selection(self):
+        runner = mock.Mock()
+        with self.assertRaisesRegex(ValueError, "only once"):
+            self.worker.listen([self.ws, self.ws], poll_interval=0.01, once=True, runner=runner)
+        runner.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -42,7 +42,7 @@ Requires Python 3.11+ and Git.
 
 ```sh
 python -m pip install -e .
-c2c doctor
+c2c --help
 ```
 
 ## Register workspaces
@@ -133,11 +133,24 @@ not while an execution claim is outstanding.
 
 ## Run the C2C execution loop
 
-Start one listener for the workspace that Codex is allowed to execute in:
+Start a listener for every workspace that Codex is explicitly allowed to execute in:
 
 ```sh
 c2c codex listen --workspace factory-Agent
 ```
+
+One process can listen to several explicitly selected workspaces while still
+running only one Codex task at a time:
+
+```sh
+c2c codex listen --workspace Codex-By-GPT --workspace factory-Agent
+```
+
+The listener holds an OS-backed lock for each selected workspace for its entire
+lifetime. A second listener that overlaps any selected workspace fails before
+Codex can run. Different, non-overlapping workspace selections may run in
+parallel processes. The OS releases ownership after Ctrl+C, a crash, or process
+termination; stale lock metadata never grants ownership.
 
 The listener processes unacknowledged `PLAN` and `REVIEW` results in order. It
 runs Codex with the registered workspace root as its fixed working directory,
@@ -162,8 +175,8 @@ changed instructions must use the next iteration and otherwise fail closed.
 The worker also skips legacy duplicate rows after one logical execution exists.
 The execution store independently enforces the same logical task-iteration
 uniqueness, even when source mailbox IDs differ.
-This idempotency guarantee assumes the documented single-listener model; it is
-not multi-worker coordination.
+The listener ownership lock enforces the single-listener-per-workspace model.
+This remains single-worker dispatch, not a multi-worker lease protocol.
 
 Starting the listener explicitly authorizes submitted `PLAN` and `REVIEW`
 messages to trigger Codex execution inside that registered workspace. Mailbox
@@ -182,8 +195,31 @@ independently inspect `git_diff`, `git_status`, and relevant files before
 submitting `REVIEW` or `DONE`.
 
 This is bounded long-polling, not an active callback that wakes an ended
-ChatGPT turn. The listener is an explicit foreground process in v0.2.0; service
+ChatGPT turn. The listener remains an explicit foreground process; service
 installation and multi-worker leases remain outside this release.
+
+## Runtime status and diagnosis
+
+Use `status` for a read-only snapshot of the gateway, tunnel process, selected
+workspace listeners, actionable mailbox backlog, execution claims, latest
+execution result, and JSONL parse health:
+
+```sh
+c2c status
+```
+
+Use `doctor` to turn that snapshot into actionable errors and warnings. It
+detects an unavailable gateway, missing or stopped tunnel client, invalid
+workspace roots, malformed state files, abnormal claims, and a stale gateway
+version:
+
+```sh
+c2c doctor
+```
+
+If `tunnel-client` is not on `PATH`, set `C2C_TUNNEL_CLIENT` to its executable
+path so `doctor` can report the configured binary. Runtime process detection is
+kept separate from connector authentication and never reads the API key.
 
 ## Security boundary
 
@@ -199,8 +235,9 @@ The Gateway rejects `..` path escapes, skips high-noise/private directories, and
 
 ## Status
 
-v0.2.1 adds task-iteration idempotency and a durable execution claim so
-transport retries or listener restarts cannot automatically execute the same
-logical step twice under the single-listener model. The next production-hardening layer
-may add OS service installation, short-lived per-session capabilities, and
-multi-worker leases.
+v0.2.2 enforces one listener per workspace with process-lifetime OS locks, adds
+runtime status and diagnosis, and supports serial dispatch across multiple
+explicitly selected workspaces. Task-iteration idempotency and conservative
+claim recovery remain unchanged. Service installation, retention/compaction,
+short-lived per-session capabilities, and multi-worker leases remain outside
+this release.

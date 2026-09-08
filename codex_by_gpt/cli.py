@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import shutil
-import subprocess
 import sys
-from pathlib import Path
 
 from .config import add_workspace, get_workspace, list_workspaces, remove_workspace
 from .mailbox import ack, list_results
 from .mcp import serve
+from .runtime import ListenerAlreadyActiveError, collect_status, doctor_report
 from .worker import listen
 
 
@@ -39,14 +36,21 @@ def build_parser() -> argparse.ArgumentParser:
     codex = sub.add_parser("codex")
     codexs = codex.add_subparsers(dest="action", required=True)
     listen_p = codexs.add_parser("listen")
-    listen_p.add_argument("--workspace", required=True)
+    listen_p.add_argument("--workspace", required=True, action="append")
     listen_p.add_argument("--poll-interval", type=float, default=1.0)
     listen_p.add_argument("--once", action="store_true")
     tun = sub.add_parser("tunnel")
     tuns = tun.add_subparsers(dest="action", required=True)
     init = tuns.add_parser("init-command"); init.add_argument("--tunnel-id", required=True); init.add_argument("--profile", default="codex-by-gpt"); init.add_argument("--port", type=int, default=8765)
     run = tuns.add_parser("run-command"); run.add_argument("--profile", default="codex-by-gpt")
-    sub.add_parser("doctor")
+    status_p = sub.add_parser("status")
+    status_p.add_argument("--host", default="127.0.0.1")
+    status_p.add_argument("--port", type=int, default=8765)
+    status_p.add_argument("--profile", default="codex-by-gpt")
+    doctor_p = sub.add_parser("doctor")
+    doctor_p.add_argument("--host", default="127.0.0.1")
+    doctor_p.add_argument("--port", type=int, default=8765)
+    doctor_p.add_argument("--profile", default="codex-by-gpt")
     return p
 
 
@@ -63,23 +67,24 @@ def main(argv=None) -> int:
         if args.action == "list": emit(list_results(args.workspace, args.task, args.all)); return 0
         if args.action == "ack": emit({"acked": ack(args.result_id)}); return 0
     if args.cmd == "codex" and args.action == "listen":
-        cfg = get_workspace(args.workspace)
-        listen(cfg, args.poll_interval, args.once)
+        configs = [get_workspace(workspace) for workspace in args.workspace]
+        try:
+            listen(configs, args.poll_interval, args.once)
+        except ListenerAlreadyActiveError as exc:
+            print(f"ERROR:\n{exc}", file=sys.stderr)
+            return 1
         return 0
     if args.cmd == "tunnel":
         if args.action == "init-command":
             emit({"env": "CONTROL_PLANE_API_KEY=<runtime-key>", "command": f'tunnel-client init --sample sample_mcp_stdio_local --profile {args.profile} --tunnel-id {args.tunnel_id} --mcp-server-url http://127.0.0.1:{args.port}/mcp', "then": f"tunnel-client doctor --profile {args.profile} --explain"}); return 0
         if args.action == "run-command": emit({"command": f"tunnel-client run --profile {args.profile}"}); return 0
+    if args.cmd == "status":
+        emit(collect_status(args.host, args.port, args.profile))
+        return 0
     if args.cmd == "doctor":
-        checks = {
-            "python": sys.version.split()[0],
-            "git": shutil.which("git"),
-            "tunnelClient": shutil.which("tunnel-client"),
-            "workspaces": len(list_workspaces()),
-            "stateHome": os.environ.get("C2C_HOME", str(Path.home() / ".codex-by-gpt")),
-        }
-        emit(checks)
-        return 0 if checks["git"] else 1
+        report = doctor_report(args.host, args.port, args.profile)
+        emit(report)
+        return 0 if report["ok"] else 1
     return 2
 
 if __name__ == "__main__":

@@ -4,11 +4,12 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
+from . import __version__
 from .config import get_workspace, list_workspaces
 from .mailbox import submit, wait_for_execution
 from .workspace import Workspace
 
-SERVER_INFO = {"name": "codex-by-gpt-gateway", "version": "0.2.1"}
+SERVER_INFO = {"name": "codex-by-gpt-gateway", "version": __version__}
 INSTRUCTIONS = (
     "This is one machine-wide read-mostly C2C gateway serving multiple registered workspaces. "
     "Always call workspace_list first, then pass the exact workspace_id to every workspace tool. "

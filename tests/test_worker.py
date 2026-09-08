@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import importlib
 import os
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -54,6 +57,64 @@ class WorkerTest(unittest.TestCase):
         self.assertFalse(self.worker.process_next(self.ws, runner))
         runner.assert_not_called()
         self.assertEqual(len(self.mailbox.list_results(self.ws.id, "task-2")), 1)
+
+    def test_cancelled_result_is_not_run(self):
+        source = self.mailbox.submit(self.ws.id, "task-cancel", 1, "PLAN", "do it")
+        self.mailbox.cancel_result(source.id, "quota exhausted")
+        runner = mock.Mock()
+        self.assertFalse(self.worker.process_next(self.ws, runner))
+        runner.assert_not_called()
+        self.assertEqual(self.mailbox.wait_for_execution(self.ws.id, "task-cancel", 1)["state"], "CANCELLED")
+
+    def test_forbidden_work_mode_intent_is_blocked_before_runner(self):
+        source = self.mailbox.submit(self.ws.id, "task-work-mode", 1, "PLAN", "Please open a ChatGPT conversation in Work mode")
+        runner = mock.Mock()
+        self.assertTrue(self.worker.process_next(self.ws, runner))
+        runner.assert_not_called()
+        receipt = self.mailbox.wait_for_execution(self.ws.id, "task-work-mode", 1)
+        self.assertEqual(receipt["state"], "BLOCKED")
+        self.assertIn("client/session control", receipt["record"]["execution_output"])
+        self.assertEqual(self.mailbox.list_results(self.ws.id, "task-work-mode"), [])
+        self.assertEqual(self.mailbox.list_results(self.ws.id, "task-work-mode", include_acked=True)[0]["id"], source.id)
+
+    def test_forbidden_chatgpt_client_synonyms_are_blocked(self):
+        payloads = [
+            "Send a message to ChatGPT",
+            "Ask ChatGPT about this task",
+            "Navigate to the ChatGPT page",
+            "向 ChatGPT 发送消息",
+            "打开 ChatGPT 页面",
+            "连接 ChatGPT 对话窗口",
+        ]
+        runner = mock.Mock()
+        for index, payload in enumerate(payloads, start=1):
+            with self.subTest(payload=payload):
+                self.mailbox.submit(self.ws.id, f"task-client-action-{index}", 1, "REVIEW", payload)
+                self.assertTrue(self.worker.process_next(self.ws, runner))
+                self.assertEqual(
+                    self.mailbox.wait_for_execution(self.ws.id, f"task-client-action-{index}", 1)["state"],
+                    "BLOCKED",
+                )
+        runner.assert_not_called()
+
+    def test_chatgpt_reference_without_client_action_is_not_blocked(self):
+        source = self.mailbox.submit(self.ws.id, "task-chatgpt-reference", 1, "PLAN", "Review the ChatGPT quota error in the local logs")
+        runner = mock.Mock(return_value=self.worker.ExecutionOutcome(0, "done", {"status": "not_run", "command": None, "summary": "ok"}))
+        self.assertTrue(self.worker.process_next(self.ws, runner))
+        runner.assert_called_once()
+        self.assertEqual(self.mailbox.get_execution(self.ws.id, "task-chatgpt-reference", 1)["state"], "EXECUTED")
+
+    def test_cancellation_after_claim_suppresses_execution_record(self):
+        source = self.mailbox.submit(self.ws.id, "task-race", 1, "PLAN", "do it")
+
+        def fake_runner(cfg, result):
+            self.mailbox.cancel_result(result["id"], "quota exhausted while starting")
+            return self.worker.ExecutionOutcome(0, "should not become executed", {"status": "passed", "command": "tests", "summary": "ok"})
+
+        self.assertTrue(self.worker.process_next(self.ws, fake_runner))
+        runner_record = self.mailbox.wait_for_execution(self.ws.id, "task-race", 1)
+        self.assertEqual(runner_record["state"], "CANCELLED")
+        self.assertNotEqual(runner_record["record"]["state"], "EXECUTED")
 
     def test_execution_write_failure_does_not_ack(self):
         source = self.mailbox.submit(self.ws.id, "task-3", 1, "REVIEW", "fix")
@@ -174,18 +235,18 @@ class WorkerTest(unittest.TestCase):
     def test_run_codex_builds_fixed_workspace_command_and_reads_final(self):
         result = {"task_id": "task-5", "iteration": 1, "kind": "PLAN", "payload": "do it"}
 
-        def fake_run(command, **kwargs):
+        def fake_run(command, prompt, result_id, cwd, workspace_id, task_id, iteration):
             final_path = Path(command[command.index("--output-last-message") + 1])
             final_path.write_text(
                 '{"summary":"done","test_status":{"status":"passed","command":"tests","summary":"ok"}}',
                 encoding="utf-8",
             )
-            self.assertEqual(kwargs["cwd"], self.ws.root)
+            self.assertEqual(cwd, self.ws.root)
             self.assertEqual(command[command.index("--cd") + 1], self.ws.root)
-            return self.worker.subprocess.CompletedProcess(command, 0, stdout="jsonl", stderr="")
+            return self.worker.ManagedProcessResult(0, "jsonl", "")
 
         with mock.patch.object(self.worker.shutil, "which", return_value="codex"), mock.patch.object(
-            self.worker.subprocess, "run", side_effect=fake_run
+            self.worker, "_run_managed_process", side_effect=fake_run
         ):
             outcome = self.worker.run_codex(self.ws, result)
         self.assertEqual(outcome.exit_code, 0)
@@ -197,23 +258,76 @@ class WorkerTest(unittest.TestCase):
             self.assertIsNone(self.worker.run_codex(self.ws, result).exit_code)
 
         with mock.patch.object(self.worker.shutil, "which", return_value="codex"), mock.patch.object(
-            self.worker.subprocess, "run", side_effect=self.worker.subprocess.TimeoutExpired("codex", 1, output="partial")
+            self.worker, "_run_managed_process", return_value=self.worker.ManagedProcessResult(None, "partial", "", timed_out=True)
         ):
             timed_out = self.worker.run_codex(self.ws, result)
         self.assertIsNone(timed_out.exit_code)
         self.assertEqual(timed_out.test_status["status"], "unknown")
 
-        def malformed_run(command, **kwargs):
+        def malformed_run(command, prompt, result_id, cwd, workspace_id, task_id, iteration):
             final_path = Path(command[command.index("--output-last-message") + 1])
             final_path.write_text("not-json", encoding="utf-8")
-            return self.worker.subprocess.CompletedProcess(command, 3, stdout="bad", stderr="error")
+            return self.worker.ManagedProcessResult(3, "bad", "error")
 
         with mock.patch.object(self.worker.shutil, "which", return_value="codex"), mock.patch.object(
-            self.worker.subprocess, "run", side_effect=malformed_run
+            self.worker, "_run_managed_process", side_effect=malformed_run
         ):
             malformed = self.worker.run_codex(self.ws, result)
         self.assertEqual(malformed.exit_code, 3)
         self.assertEqual(malformed.test_status["status"], "unknown")
+
+    def test_running_codex_process_is_terminated_after_cancellation(self):
+        source = self.mailbox.submit(self.ws.id, "task-running-cancel", 1, "PLAN", "do it")
+
+        def cancel_later():
+            time.sleep(0.2)
+            self.mailbox.cancel_result(source.id, "quota exhausted while running")
+
+        canceller = threading.Thread(target=cancel_later)
+        canceller.start()
+        managed = self.worker._run_managed_process(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            "",
+            source.id,
+            self.ws.root,
+            self.ws.id,
+            "task-running-cancel",
+            1,
+        )
+        canceller.join(timeout=5)
+
+        self.assertTrue(managed.cancelled)
+        self.assertIsNotNone(managed.exit_code)
+        self.assertEqual(self.worker._ACTIVE_PROCESSES, {})
+
+    def test_process_next_records_cancelled_after_real_process_termination(self):
+        source = self.mailbox.submit(self.ws.id, "task-e2e-cancel", 1, "PLAN", "do it")
+
+        def runner(cfg, result):
+            def cancel_later():
+                time.sleep(0.2)
+                self.mailbox.cancel_result(result["id"], "quota exhausted in end-to-end run")
+
+            canceller = threading.Thread(target=cancel_later)
+            canceller.start()
+            managed = self.worker._run_managed_process(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                "",
+                result["id"],
+                cfg.root,
+                cfg.id,
+                result["task_id"],
+                int(result["iteration"]),
+            )
+            canceller.join(timeout=5)
+            self.assertTrue(managed.cancelled)
+            self.assertIsNotNone(managed.exit_code)
+            return self.worker.ExecutionOutcome(managed.exit_code, "cancelled child", {"status": "unknown", "command": None, "summary": "cancelled"})
+
+        self.assertTrue(self.worker.process_next(self.ws, runner))
+        self.assertEqual(self.mailbox.wait_for_execution(self.ws.id, "task-e2e-cancel", 1)["state"], "CANCELLED")
+        self.assertIsNone(self.mailbox.get_execution_claim(self.ws.id, "task-e2e-cancel", 1))
+        self.assertEqual(self.mailbox.list_results(self.ws.id, "task-e2e-cancel"), [])
 
     def test_multi_workspace_listener_dispatches_one_explicit_workspace(self):
         other_root = Path(self.tmp.name) / "other"

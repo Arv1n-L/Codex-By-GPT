@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
+import subprocess
 import threading
 import time
 import uuid
@@ -40,6 +42,12 @@ class Result:
     payload: str
     created_at: float
     acked: bool = False
+    cancelled: bool = False
+    cancel_reason: str | None = None
+    cancelled_at: float | None = None
+    blocked: bool = False
+    block_reason: str | None = None
+    blocked_at: float | None = None
 
 
 @dataclass
@@ -63,6 +71,7 @@ class ExecutionClaim:
     iteration: int
     source_result_id: str
     created_at: float
+    process_pid: int | None = None
 
 
 class SubmissionConflictError(ValueError):
@@ -179,6 +188,14 @@ def ack(result_id: str) -> bool:
     return changed
 
 
+def is_cancelled(result_id: str) -> bool:
+    row = next((row for row in _load() if row["id"] == result_id), None)
+    if row and row.get("cancelled"):
+        return True
+    record = execution_for_source(result_id)
+    return bool(record and record.get("state") in {"CANCELLED", "SUPERSEDED", "BLOCKED"})
+
+
 def _load_executions() -> list[dict[str, Any]]:
     if not EXECUTIONS_FILE.exists():
         return []
@@ -249,6 +266,20 @@ def claim_execution(workspace_id: str, task_id: str, iteration: int, source_resu
     return claim
 
 
+def set_execution_claim_process(workspace_id: str, task_id: str, iteration: int, process_pid: int) -> bool:
+    if process_pid <= 0:
+        raise ValueError("process_pid must be > 0")
+    with _locked(EXECUTION_CLAIMS_FILE):
+        rows = _load_execution_claims()
+        key = (workspace_id, task_id, iteration)
+        for row in reversed(rows):
+            if _logical_key(row) == key:
+                row["process_pid"] = process_pid
+                _save_execution_claims(rows)
+                return True
+    return False
+
+
 def clear_execution_claim(workspace_id: str, task_id: str, iteration: int) -> bool:
     with _locked(EXECUTION_CLAIMS_FILE):
         rows = _load_execution_claims()
@@ -286,6 +317,7 @@ def record_execution(
     codex_exit_code: int | None,
     execution_output: str,
     test_status: dict[str, Any] | None,
+    state: str = "EXECUTED",
 ) -> ExecutionRecord:
     if iteration < 0:
         raise ValueError("iteration must be >= 0")
@@ -307,13 +339,15 @@ def record_execution(
                 "status": "unknown",
                 "summary": "Codex exited non-zero; a passing test claim cannot be trusted.",
             }
+        if state not in {"EXECUTED", "CANCELLED", "SUPERSEDED", "BLOCKED"}:
+            raise ValueError("invalid execution state")
         record = ExecutionRecord(
             id=str(uuid.uuid4()),
             workspace_id=workspace_id,
             task_id=task_id,
             iteration=iteration,
             source_result_id=source_result_id,
-            state="EXECUTED",
+            state=state,
             codex_exit_code=codex_exit_code,
             execution_output=clipped_output,
             test_status=normalized_test_status,
@@ -321,6 +355,139 @@ def record_execution(
         )
         rows.append(asdict(record))
         _save_executions(rows)
+    return record
+
+
+def record_cancellation(
+    workspace_id: str,
+    task_id: str,
+    iteration: int,
+    source_result_id: str,
+    reason: str,
+    state: str = "CANCELLED",
+) -> ExecutionRecord:
+    reason = _redact_execution_output(str(reason)).strip()
+    if not reason:
+        raise ValueError("reason is required")
+    return record_execution(
+        workspace_id,
+        task_id,
+        iteration,
+        source_result_id,
+        None,
+        reason,
+        {"status": "not_run", "command": None, "summary": reason},
+        state=state,
+    )
+
+
+def record_blocked(
+    workspace_id: str,
+    task_id: str,
+    iteration: int,
+    source_result_id: str,
+    reason: str,
+) -> ExecutionRecord:
+    reason = _redact_execution_output(str(reason)).strip()
+    if not reason:
+        raise ValueError("reason is required")
+    return record_execution(
+        workspace_id,
+        task_id,
+        iteration,
+        source_result_id,
+        None,
+        reason,
+        {"status": "not_run", "command": None, "summary": reason},
+        state="BLOCKED",
+    )
+
+
+def _terminate_claimed_process(process_pid: int) -> bool:
+    """Terminate a persisted worker child from the connector process."""
+    if process_pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(process_pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return completed.returncode == 0
+        os.kill(process_pid, signal.SIGTERM)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def cancel_result(result_id: str, reason: str) -> ExecutionRecord:
+    """Cancel one exact mailbox result and persist an immutable terminal receipt."""
+    reason = _redact_execution_output(str(reason)).strip()
+    if not reason:
+        raise ValueError("reason is required")
+    existing = execution_for_source(result_id)
+    if existing:
+        if existing.get("state") in {"CANCELLED", "SUPERSEDED"}:
+            return ExecutionRecord(**existing)
+        raise RuntimeError("result already has EXECUTED evidence and cannot be cancelled")
+    with _locked(MAILBOX_FILE):
+        rows = _load()
+        row = next((row for row in rows if row["id"] == result_id), None)
+        if row is None:
+            raise ValueError(f"mailbox result not found: {result_id}")
+        if row.get("cancelled"):
+            existing = execution_for_source(result_id)
+            if existing:
+                return ExecutionRecord(**existing)
+        row["cancelled"] = True
+        row["cancel_reason"] = reason
+        row["cancelled_at"] = time.time()
+        row["acked"] = True
+        _save(rows)
+    state = "SUPERSEDED" if reason.upper().startswith("SUPERSEDED") else "CANCELLED"
+    claim = get_execution_claim(row["workspace_id"], row["task_id"], int(row["iteration"]))
+    process_pid = int(claim["process_pid"]) if claim and claim.get("process_pid") else None
+    if process_pid:
+        _terminate_claimed_process(process_pid)
+    record = record_cancellation(row["workspace_id"], row["task_id"], int(row["iteration"]), result_id, reason, state)
+    if not process_pid:
+        clear_execution_claim(row["workspace_id"], row["task_id"], int(row["iteration"]))
+    return record
+
+
+def block_result(result_id: str, reason: str) -> ExecutionRecord:
+    """Fail closed for one exact result and persist an immutable BLOCKED receipt."""
+    reason = _redact_execution_output(str(reason)).strip()
+    if not reason:
+        raise ValueError("reason is required")
+    existing = execution_for_source(result_id)
+    if existing:
+        if existing.get("state") == "BLOCKED":
+            return ExecutionRecord(**existing)
+        raise RuntimeError("result already has terminal execution evidence and cannot be blocked")
+    with _locked(MAILBOX_FILE):
+        rows = _load()
+        row = next((row for row in rows if row["id"] == result_id), None)
+        if row is None:
+            raise ValueError(f"mailbox result not found: {result_id}")
+        if row.get("blocked"):
+            existing = execution_for_source(result_id)
+            if existing:
+                return ExecutionRecord(**existing)
+        row["blocked"] = True
+        row["block_reason"] = reason
+        row["blocked_at"] = time.time()
+        row["acked"] = True
+        _save(rows)
+    claim = get_execution_claim(row["workspace_id"], row["task_id"], int(row["iteration"]))
+    process_pid = int(claim["process_pid"]) if claim and claim.get("process_pid") else None
+    if process_pid:
+        _terminate_claimed_process(process_pid)
+    record = record_blocked(row["workspace_id"], row["task_id"], int(row["iteration"]), result_id, reason)
+    if not process_pid:
+        clear_execution_claim(row["workspace_id"], row["task_id"], int(row["iteration"]))
     return record
 
 
@@ -344,7 +511,7 @@ def wait_for_execution(workspace_id: str, task_id: str, iteration: int, timeout_
     while True:
         record = get_execution(workspace_id, task_id, iteration)
         if record:
-            return {"state": "EXECUTED", "record": record}
+            return {"state": record.get("state", "EXECUTED"), "record": record}
         if time.monotonic() >= deadline:
             return {
                 "state": "PENDING",

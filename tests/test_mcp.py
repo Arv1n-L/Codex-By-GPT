@@ -31,15 +31,25 @@ class McpTest(unittest.TestCase):
         names = {tool["name"] for tool in self.mcp.TOOLS}
         self.assertIn("submit_result", names)
         self.assertFalse(names & {"write_file", "delete_file", "shell", "exec", "git_commit", "git_push"})
+        cancel = next(tool for tool in self.mcp.TOOLS if tool["name"] == "cancel_result")
+        self.assertFalse(cancel["annotations"]["readOnlyHint"])
 
     def test_initialize_and_tools_list(self):
         init = self.mcp.handle_rpc({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
         self.assertEqual(init["result"]["serverInfo"]["name"], "codex-by-gpt-gateway")
         self.assertEqual(init["result"]["serverInfo"]["version"], "0.2.2")
+        self.assertIn("HARD POLICY", init["result"]["instructions"])
+        self.assertIn("never use ChatGPT Work mode", init["result"]["instructions"])
         self.assertIn("preflight", init["result"]["instructions"])
         self.assertIn("BLOCKED", init["result"]["instructions"])
         tools = self.mcp.handle_rpc({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
         self.assertGreaterEqual(len(tools["result"]["tools"]), 8)
+
+    def test_cancel_result_action_returns_terminal_receipt(self):
+        source = self.mcp.call_tool("submit_result", {"workspace_id": self.ws.id, "task_id": "task-cancel", "iteration": 1, "kind": "PLAN", "payload": "old"})
+        result_id = json.loads(source["content"][0]["text"])["resultId"]
+        cancelled = self.mcp.call_tool("cancel_result", {"result_id": result_id, "reason": "quota exhausted"})
+        self.assertIn('"state": "CANCELLED"', cancelled["content"][0]["text"])
 
     def test_wait_execution_is_read_only_and_returns_evidence(self):
         wait_tool = next(tool for tool in self.mcp.TOOLS if tool["name"] == "wait_execution")

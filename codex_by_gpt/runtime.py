@@ -45,6 +45,7 @@ CORE_MCP_TOOLS = frozenset(
         "git_diff",
         "submit_result",
         "wait_execution",
+        "cancel_result",
     }
 )
 EXPECTED_MCP_TOOLS = {tool["name"]: tool for tool in MCP_TOOLS}

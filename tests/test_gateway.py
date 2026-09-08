@@ -78,7 +78,46 @@ class GatewayTest(unittest.TestCase):
         acked_retry = self.mailbox.submit(ws.id, "task-retry", 1, "PLAN", "same")
         self.assertEqual(acked_retry.id, first.id)
         self.assertTrue(acked_retry.acked)
+
+    def test_cancel_result_is_terminal_and_idempotent(self):
+        root = Path(self.tmp.name) / "a"; root.mkdir()
+        ws = self.config.add_workspace(str(root))
+        source = self.mailbox.submit(ws.id, "task-cancel", 1, "PLAN", "old plan")
+        first = self.mailbox.cancel_result(source.id, "quota exhausted")
+        retry = self.mailbox.cancel_result(source.id, "different wording")
+        self.assertEqual(first.id, retry.id)
+        self.assertEqual(first.state, "CANCELLED")
+        self.assertEqual(self.mailbox.wait_for_execution(ws.id, "task-cancel", 1)["state"], "CANCELLED")
+        self.assertEqual(self.mailbox.list_results(ws.id, "task-cancel"), [])
+        visible = self.mailbox.list_results(ws.id, "task-cancel", include_acked=True)[0]
+        self.assertTrue(visible["acked"])
+        self.assertTrue(visible["cancelled"])
+
+    def test_cancel_does_not_rewrite_existing_execution_or_other_iteration(self):
+        root = Path(self.tmp.name) / "a"; root.mkdir()
+        ws = self.config.add_workspace(str(root))
+        first = self.mailbox.submit(ws.id, "task-supersede", 1, "PLAN", "old")
+        second = self.mailbox.submit(ws.id, "task-supersede", 2, "PLAN", "new")
+        cancelled = self.mailbox.cancel_result(first.id, "SUPERSEDED by iteration 2")
+        self.assertEqual(cancelled.state, "SUPERSEDED")
+        self.assertEqual(self.mailbox.list_results(ws.id, "task-supersede", include_acked=True)[1]["payload"], "new")
+        self.mailbox.record_execution(ws.id, "task-done", 1, "done-source", 0, "done", {"status": "passed"})
+        with self.assertRaisesRegex(RuntimeError, "EXECUTED"):
+            self.mailbox.cancel_result("done-source", "too late")
         self.assertEqual(self.mailbox.list_results(ws.id, "task-retry"), [])
+
+    def test_block_result_is_terminal_and_idempotent(self):
+        root = Path(self.tmp.name) / "a"; root.mkdir()
+        ws = self.config.add_workspace(str(root))
+        source = self.mailbox.submit(ws.id, "task-block", 1, "PLAN", "open ChatGPT Work mode")
+        first = self.mailbox.block_result(source.id, "BLOCKED: client session control is forbidden")
+        retry = self.mailbox.block_result(source.id, "different wording")
+        self.assertEqual(first.id, retry.id)
+        self.assertEqual(first.state, "BLOCKED")
+        self.assertEqual(self.mailbox.wait_for_execution(ws.id, "task-block", 1)["state"], "BLOCKED")
+        visible = self.mailbox.list_results(ws.id, "task-block", include_acked=True)[0]
+        self.assertTrue(visible["blocked"])
+        self.assertTrue(visible["acked"])
 
     def test_conflicting_retry_is_rejected_without_append(self):
         root = Path(self.tmp.name) / "a"; root.mkdir()

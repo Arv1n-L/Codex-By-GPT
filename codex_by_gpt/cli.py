@@ -5,7 +5,7 @@ import json
 import sys
 
 from .config import add_workspace, get_workspace, list_workspaces, remove_workspace
-from .mailbox import ack, list_results
+from .mailbox import ack, cancel_result, list_results
 from .mcp import serve
 from .runtime import ListenerAlreadyActiveError, collect_status, doctor_report
 from .service import (
@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     mbs = mb.add_subparsers(dest="action", required=True)
     ls = mbs.add_parser("list"); ls.add_argument("--workspace"); ls.add_argument("--task"); ls.add_argument("--all", action="store_true")
     ak = mbs.add_parser("ack"); ak.add_argument("result_id")
+    cancel = mbs.add_parser("cancel"); cancel.add_argument("result_id"); cancel.add_argument("--reason", required=True)
     codex = sub.add_parser("codex")
     codexs = codex.add_subparsers(dest="action", required=True)
     listen_p = codexs.add_parser("listen")
@@ -97,6 +98,7 @@ def main(argv=None) -> int:
     if args.cmd == "mailbox":
         if args.action == "list": emit(list_results(args.workspace, args.task, args.all)); return 0
         if args.action == "ack": emit({"acked": ack(args.result_id)}); return 0
+        if args.action == "cancel": emit({"cancelled": True, "record": cancel_result(args.result_id, args.reason).__dict__}); return 0
     if args.cmd == "codex" and args.action == "listen":
         configs = [get_workspace(workspace) for workspace in args.workspace]
         try:

@@ -28,11 +28,26 @@ from .config import (
     list_workspaces,
 )
 from .mailbox import _redact_execution_output
+from .mcp import TOOLS as MCP_TOOLS
 
 LISTENER_DIR = APP_DIR / "listeners"
 CLAIM_STALE_SECONDS = 2 * 60 * 60 + 60
 DEFAULT_TUNNEL_HEALTH_URL = "http://127.0.0.1:8080"
 MAX_TUNNEL_PROBE_BODY_CHARS = 2048
+CORE_MCP_TOOLS = frozenset(
+    {
+        "workspace_list",
+        "workspace_info",
+        "list_directory",
+        "read_file",
+        "search_workspace",
+        "git_status",
+        "git_diff",
+        "submit_result",
+        "wait_execution",
+    }
+)
+EXPECTED_MCP_TOOLS = {tool["name"]: tool for tool in MCP_TOOLS}
 _PROCESS_LOCK = RLock()
 _ACTIVE_LISTENERS: set[str] = set()
 
@@ -240,6 +255,76 @@ def _gateway_status(host: str, port: int) -> dict[str, Any]:
         return {"status": "STOPPED", "endpoint": endpoint, "error": str(exc)}
 
 
+def _mcp_preflight(host: str = "127.0.0.1", port: int = 8765) -> dict[str, Any]:
+    """Exercise the local MCP protocol without mutating workspace or mailbox state."""
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        return {"status": "FAILED", "code": "MCP_PREFLIGHT_NON_LOOPBACK", "message": "non-loopback Gateway rejected"}
+    endpoint = f"http://{host}:{port}/mcp"
+
+    def call(rpc_id: int, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        body = json.dumps({"jsonrpc": "2.0", "id": rpc_id, "method": method, "params": params or {}}).encode("utf-8")
+        request = urllib.request.Request(endpoint, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=1.0) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict) or "error" in payload or not isinstance(payload.get("result"), dict):
+            raise RuntimeError(f"invalid {method} response")
+        return payload["result"]
+
+    try:
+        initialized = call(1, "initialize")
+        if initialized.get("protocolVersion") != "2025-06-18":
+            return {
+                "status": "FAILED",
+                "code": "VERSION_MISMATCH",
+                "endpoint": endpoint,
+                "message": f"unsupported MCP protocol: {initialized.get('protocolVersion')}",
+            }
+        server = initialized.get("serverInfo")
+        if not isinstance(server, dict) or server.get("name") != "codex-by-gpt-gateway" or server.get("version") != __version__:
+            return {
+                "status": "FAILED",
+                "code": "VERSION_MISMATCH",
+                "endpoint": endpoint,
+                "message": "Gateway server metadata does not match the local package",
+            }
+        listed = call(2, "tools/list")
+        tools = listed.get("tools")
+        if not isinstance(tools, list):
+            return {"status": "FAILED", "code": "MCP_CATALOG_INVALID", "endpoint": endpoint, "message": "tools/list returned no tool list"}
+        names = [tool.get("name") for tool in tools if isinstance(tool, dict)]
+        if any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
+            return {"status": "FAILED", "code": "MCP_CATALOG_INVALID", "endpoint": endpoint, "message": "tools/list contains invalid or duplicate tool names"}
+        by_name = {tool["name"]: tool for tool in tools}
+        missing = sorted(CORE_MCP_TOOLS - set(names))
+        if missing:
+            return {"status": "FAILED", "code": "ACTION_SET_INCOMPLETE", "endpoint": endpoint, "missing": missing}
+        invalid = []
+        for name, expected in EXPECTED_MCP_TOOLS.items():
+            actual = by_name.get(name)
+            if not isinstance(actual, dict) or actual.get("inputSchema") != expected.get("inputSchema") or actual.get("annotations") != expected.get("annotations"):
+                invalid.append(name)
+        if invalid:
+            return {"status": "FAILED", "code": "MCP_CATALOG_INVALID", "endpoint": endpoint, "invalid": sorted(invalid)}
+        workspace_result = call(3, "tools/call", {"name": "workspace_list", "arguments": {}})
+        content = workspace_result.get("content")
+        if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+            raise RuntimeError("workspace_list returned no content")
+        text = content[0].get("text")
+        workspaces = json.loads(text) if isinstance(text, str) else None
+        if not isinstance(workspaces, dict) or not isinstance(workspaces.get("workspaces"), list):
+            raise RuntimeError("workspace_list returned invalid data")
+        return {
+            "status": "READY",
+            "endpoint": endpoint,
+            "protocolVersion": initialized.get("protocolVersion"),
+            "server": server,
+            "toolNames": sorted(names),
+            "workspaceCount": len(workspaces["workspaces"]),
+        }
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, urllib.error.URLError, RuntimeError, TypeError, ValueError) as exc:
+        return {"status": "FAILED", "code": "MCP_CALL_FAILED", "endpoint": endpoint, "message": str(exc)}
+
+
 def _tunnel_process_running() -> bool:
     try:
         if os.name == "nt":
@@ -423,6 +508,15 @@ def diagnose(status: dict[str, Any]) -> list[dict[str, str]]:
             "GATEWAY_VERSION_MISMATCH",
             f"gateway reports {(gateway.get('server') or {}).get('version')} but local package is {status['version']}",
         )
+    mcp = status.get("mcpPreflight")
+    if mcp and mcp.get("status") != "READY":
+        code = str(mcp.get("code") or "MCP_PREFLIGHT_FAILED")
+        message = str(mcp.get("message") or code)
+        if mcp.get("missing"):
+            message = f"missing MCP actions: {', '.join(mcp['missing'])}"
+        add("ERROR", code, message)
+    elif mcp and mcp.get("status") == "READY":
+        add("INFO", "CLIENT_ACTIONS_UNVERIFIED", "local MCP is ready; the current ChatGPT session still requires connector refresh or a new chat to verify action mounting")
     tunnel = status["tunnel"]
     if tunnel["status"] == "UNAVAILABLE":
         add("ERROR", "TUNNEL_CLIENT_NOT_FOUND", "tunnel-client is not running and its executable was not found")
@@ -476,6 +570,7 @@ def diagnose(status: dict[str, Any]) -> list[dict[str, str]]:
 
 def doctor_report(host: str = "127.0.0.1", port: int = 8765, profile: str = "codex-by-gpt") -> dict[str, Any]:
     status = collect_status(host, port, profile)
+    status["mcpPreflight"] = _mcp_preflight(host, port)
     issues = diagnose(status)
     return {
         "ok": not any(issue["severity"] == "ERROR" for issue in issues),

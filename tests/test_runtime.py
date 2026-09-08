@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import copy
+import json
 import os
 import subprocess
 import sys
@@ -156,6 +158,76 @@ class RuntimeTest(unittest.TestCase):
             self.runtime, "_tunnel_process_running", return_value=True
         ), mock.patch.object(self.runtime, "_probe_tunnel_endpoint", side_effect=[(200, None), (200, None)]):
             self.assertEqual(self.runtime._tunnel_status("codex-by-gpt")["status"], "READY")
+
+    def test_mcp_preflight_exercises_protocol_and_workspace_list(self):
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        tools = copy.deepcopy(list(self.runtime.EXPECTED_MCP_TOOLS.values()))
+        responses = [
+            Response({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18", "serverInfo": {"name": "codex-by-gpt-gateway", "version": "0.2.2"}}}),
+            Response({"jsonrpc": "2.0", "id": 2, "result": {"tools": tools}}),
+            Response({"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": json.dumps({"workspaces": [{"workspaceId": self.ws.id}]})} ]}}),
+        ]
+        with mock.patch.object(self.runtime.urllib.request, "urlopen", side_effect=responses) as urlopen:
+            result = self.runtime._mcp_preflight()
+        self.assertEqual(result["status"], "READY")
+        self.assertEqual(result["workspaceCount"], 1)
+        self.assertEqual(urlopen.call_count, 3)
+
+    def test_mcp_preflight_rejects_catalog_schema_drift(self):
+        class Response:
+            def __init__(self, payload): self.payload = payload
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return json.dumps(self.payload).encode("utf-8")
+
+        tools = copy.deepcopy(list(self.runtime.EXPECTED_MCP_TOOLS.values()))
+        tools[0]["annotations"] = {"readOnlyHint": False}
+        responses = [
+            Response({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18", "serverInfo": {"name": "codex-by-gpt-gateway", "version": "0.2.2"}}}),
+            Response({"jsonrpc": "2.0", "id": 2, "result": {"tools": tools}}),
+        ]
+        with mock.patch.object(self.runtime.urllib.request, "urlopen", side_effect=responses):
+            result = self.runtime._mcp_preflight()
+        self.assertEqual(result["code"], "MCP_CATALOG_INVALID")
+        self.assertIn("workspace_list", result["invalid"])
+
+    def test_mcp_preflight_reports_incomplete_action_set(self):
+        class Response:
+            def __init__(self, payload): self.payload = payload
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        responses = [
+            Response({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18", "serverInfo": {"name": "codex-by-gpt-gateway", "version": "0.2.2"}}}),
+            Response({"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "workspace_list"}]}}),
+        ]
+        with mock.patch.object(self.runtime.urllib.request, "urlopen", side_effect=responses):
+            result = self.runtime._mcp_preflight()
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["code"], "ACTION_SET_INCOMPLETE")
+        self.assertIn("workspace_info", result["missing"])
+
+    def test_mcp_preflight_rejects_non_loopback(self):
+        result = self.runtime._mcp_preflight("192.0.2.1", 8765)
+        self.assertEqual(result["code"], "MCP_PREFLIGHT_NON_LOOPBACK")
 
     def test_detailed_tunnel_probe_captures_bounded_redacted_body(self):
         os.environ["chatgpt-apikey"] = "probe-secret-value"

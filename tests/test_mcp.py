@@ -36,6 +36,8 @@ class McpTest(unittest.TestCase):
         init = self.mcp.handle_rpc({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
         self.assertEqual(init["result"]["serverInfo"]["name"], "codex-by-gpt-gateway")
         self.assertEqual(init["result"]["serverInfo"]["version"], "0.2.2")
+        self.assertIn("preflight", init["result"]["instructions"])
+        self.assertIn("BLOCKED", init["result"]["instructions"])
         tools = self.mcp.handle_rpc({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
         self.assertGreaterEqual(len(tools["result"]["tools"]), 8)
 

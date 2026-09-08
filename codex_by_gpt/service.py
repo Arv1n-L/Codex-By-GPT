@@ -21,6 +21,7 @@ from . import config
 from .config import WorkspaceConfig, get_workspace
 from .runtime import (
     DEFAULT_TUNNEL_HEALTH_URL,
+    _mcp_preflight,
     _gateway_status,
     _probe_tunnel_endpoint_detailed,
     _tunnel_executable,
@@ -606,6 +607,10 @@ class ServiceSupervisor:
                 self._spawn(self.children["gateway"])
                 if not self._wait_gateway(): raise RuntimeError("gateway did not become HEALTHY")
                 self.children["gateway"].state = "RUNNING"
+                mcp = _mcp_preflight(self.config.gateway_host, self.config.gateway_port)
+                if mcp.get("status") != "READY":
+                    code = mcp.get("code", "MCP_PREFLIGHT_FAILED")
+                    raise RuntimeError(f"{code}: {mcp.get('message', 'local MCP preflight failed')}")
                 self._spawn(self.children["tunnel"])
                 if not self._wait_tunnel(): raise RuntimeError("tunnel did not become READY")
                 self.children["tunnel"].state = "RUNNING"

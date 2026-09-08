@@ -166,6 +166,20 @@ class ServiceTest(unittest.TestCase):
         self.assertFalse(supervisor._wait_gateway(timeout=0.1))
         self.assertTrue(supervisor.stop_requested)
 
+    def test_startup_blocks_tunnel_when_mcp_preflight_fails(self):
+        cfg = self.service.ServiceConfig("tunnel_x", [self.ws.id], tunnel_client=str(self.tunnel))
+        supervisor = self.service.ServiceSupervisor(cfg)
+        spawned = []
+        with mock.patch.object(supervisor.lock, "acquire", return_value=True), mock.patch.object(supervisor.lock, "release"), mock.patch.object(
+            supervisor.job, "close"
+        ), mock.patch.object(supervisor, "_preflight", return_value=[self.ws]), mock.patch.object(
+            supervisor, "_spawn", side_effect=lambda child: spawned.append(child.name)
+        ), mock.patch.object(supervisor, "_wait_gateway", return_value=True), mock.patch.object(
+            self.service, "_mcp_preflight", return_value={"status": "FAILED", "code": "MCP_CATALOG_INVALID", "message": "invalid catalog"}
+        ), mock.patch.object(supervisor, "_persist"), mock.patch.object(self.service, "_clear_control"):
+            self.assertEqual(supervisor.run(), 1)
+        self.assertEqual(spawned, ["gateway"])
+
     def test_tunnel_readiness_timeout_logs_bounded_probe_reason(self):
         os.environ["chatgpt-apikey"] = "probe-secret-value"
         cfg = self.service.ServiceConfig("tunnel_x", [self.ws.id], tunnel_client=str(self.tunnel))

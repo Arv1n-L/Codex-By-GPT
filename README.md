@@ -200,7 +200,7 @@ installation and multi-worker leases remain outside this release.
 
 ## Runtime status and diagnosis
 
-Use `status` for a read-only snapshot of the gateway, tunnel process, selected
+Use `status` for a read-only snapshot of the gateway, tunnel readiness, selected
 workspace listeners, actionable mailbox backlog, execution claims, latest
 execution result, and JSONL parse health:
 
@@ -209,17 +209,23 @@ c2c status
 ```
 
 Use `doctor` to turn that snapshot into actionable errors and warnings. It
-detects an unavailable gateway, missing or stopped tunnel client, invalid
-workspace roots, malformed state files, abnormal claims, and a stale gateway
-version:
+detects an unavailable gateway, missing/stopped tunnel client, a tunnel that is
+still starting or not ready, invalid workspace roots, malformed state files,
+abnormal claims, and a stale gateway version:
 
 ```sh
 c2c doctor
 ```
 
-If `tunnel-client` is not on `PATH`, set `C2C_TUNNEL_CLIENT` to its executable
-path so `doctor` can report the configured binary. Runtime process detection is
-kept separate from connector authentication and never reads the API key.
+The tunnel status combines process detection with the local tunnel-client
+`/healthz` and `/readyz` endpoints: `READY` means both endpoints returned 200;
+`STARTING` means the process exists but health is not responding yet, and
+`NOT_READY` means health is up while runtime readiness is not. Set
+`C2C_TUNNEL_HEALTH_URL` when the local health server uses a non-default base
+URL (default `http://127.0.0.1:8080`). If `tunnel-client` is not on `PATH`, set
+`C2C_TUNNEL_CLIENT` to its executable path so `doctor` can report the configured
+binary. Runtime process detection is kept separate from connector
+authentication and never reads the API key.
 
 ## Security boundary
 

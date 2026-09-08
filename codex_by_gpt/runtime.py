@@ -28,6 +28,7 @@ from .config import (
 
 LISTENER_DIR = APP_DIR / "listeners"
 CLAIM_STALE_SECONDS = 2 * 60 * 60 + 60
+DEFAULT_TUNNEL_HEALTH_URL = "http://127.0.0.1:8080"
 _PROCESS_LOCK = RLock()
 _ACTIVE_LISTENERS: set[str] = set()
 
@@ -261,16 +262,44 @@ def _tunnel_executable() -> str | None:
     return shutil.which("tunnel-client")
 
 
-def _tunnel_status(profile: str) -> dict[str, Any]:
+def _probe_tunnel_endpoint(url: str) -> tuple[int | None, str | None]:
+    try:
+        with urllib.request.urlopen(url, timeout=1.0) as response:
+            return response.status, None
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+    except (OSError, urllib.error.URLError) as exc:
+        return None, str(exc)
+
+
+def _tunnel_status(profile: str, health_url: str | None = None) -> dict[str, Any]:
     executable = _tunnel_executable()
     running = _tunnel_process_running()
-    if running:
-        status = "RUNNING"
-    elif executable:
-        status = "STOPPED"
+    health_url = (health_url or os.environ.get("C2C_TUNNEL_HEALTH_URL") or DEFAULT_TUNNEL_HEALTH_URL).rstrip("/")
+    result: dict[str, Any] = {
+        "status": "UNAVAILABLE" if not executable and not running else "STOPPED" if not running else "STARTING",
+        "profile": profile,
+        "executable": executable,
+        "healthUrl": health_url,
+        "healthz": None,
+        "readyz": None,
+    }
+    if not running:
+        return result
+
+    healthz, health_error = _probe_tunnel_endpoint(f"{health_url}/healthz")
+    readyz, ready_error = _probe_tunnel_endpoint(f"{health_url}/readyz") if healthz == 200 else (None, None)
+    result["healthz"] = healthz
+    result["readyz"] = readyz
+    if health_error or ready_error:
+        result["error"] = health_error or ready_error
+    if healthz == 200 and readyz == 200:
+        result["status"] = "READY"
+    elif healthz == 200:
+        result["status"] = "NOT_READY"
     else:
-        status = "UNAVAILABLE"
-    return {"status": status, "profile": profile, "executable": executable}
+        result["status"] = "STARTING"
+    return result
 
 
 def collect_status(host: str = "127.0.0.1", port: int = 8765, profile: str = "codex-by-gpt") -> dict[str, Any]:
@@ -356,7 +385,13 @@ def diagnose(status: dict[str, Any]) -> list[dict[str, str]]:
     if tunnel["status"] == "UNAVAILABLE":
         add("ERROR", "TUNNEL_CLIENT_NOT_FOUND", "tunnel-client is not running and its executable was not found")
     elif tunnel["status"] == "STOPPED":
-        add("WARNING", "TUNNEL_STOPPED", f"tunnel profile {tunnel['profile']} is not running")
+        add("ERROR", "TUNNEL_STOPPED", f"tunnel profile {tunnel['profile']} is not running")
+    elif tunnel["status"] in {"STARTING", "NOT_READY"}:
+        add(
+            "ERROR",
+            "TUNNEL_NOT_READY",
+            f"tunnel profile {tunnel['profile']} is {tunnel['status'].lower()} at {tunnel.get('healthUrl', DEFAULT_TUNNEL_HEALTH_URL)}",
+        )
     elif not tunnel.get("executable"):
         add("WARNING", "TUNNEL_PATH_UNKNOWN", "tunnel-client is running but its executable is not on PATH or C2C_TUNNEL_CLIENT")
 

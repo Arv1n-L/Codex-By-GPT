@@ -130,6 +130,46 @@ class RuntimeTest(unittest.TestCase):
             <= codes
         )
 
+    def test_tunnel_status_distinguishes_process_and_readiness(self):
+        with mock.patch.object(self.runtime, "_tunnel_executable", return_value=None), mock.patch.object(
+            self.runtime, "_tunnel_process_running", return_value=False
+        ):
+            self.assertEqual(self.runtime._tunnel_status("codex-by-gpt")["status"], "UNAVAILABLE")
+
+        with mock.patch.object(self.runtime, "_tunnel_executable", return_value="C:/tunnel-client.exe"), mock.patch.object(
+            self.runtime, "_tunnel_process_running", return_value=False
+        ):
+            self.assertEqual(self.runtime._tunnel_status("codex-by-gpt")["status"], "STOPPED")
+
+        with mock.patch.object(self.runtime, "_tunnel_executable", return_value="C:/tunnel-client.exe"), mock.patch.object(
+            self.runtime, "_tunnel_process_running", return_value=True
+        ), mock.patch.object(self.runtime, "_probe_tunnel_endpoint", side_effect=[(200, None), (503, None)]) as probe:
+            status = self.runtime._tunnel_status("codex-by-gpt", "http://127.0.0.1:9999/")
+        self.assertEqual(status["status"], "NOT_READY")
+        self.assertEqual(status["healthUrl"], "http://127.0.0.1:9999")
+        self.assertEqual(status["healthz"], 200)
+        self.assertEqual(status["readyz"], 503)
+        self.assertEqual(probe.call_args_list[0].args[0], "http://127.0.0.1:9999/healthz")
+        self.assertEqual(probe.call_args_list[1].args[0], "http://127.0.0.1:9999/readyz")
+
+        with mock.patch.object(self.runtime, "_tunnel_executable", return_value="C:/tunnel-client.exe"), mock.patch.object(
+            self.runtime, "_tunnel_process_running", return_value=True
+        ), mock.patch.object(self.runtime, "_probe_tunnel_endpoint", side_effect=[(200, None), (200, None)]):
+            self.assertEqual(self.runtime._tunnel_status("codex-by-gpt")["status"], "READY")
+
+    def test_doctor_treats_stopped_or_unready_tunnel_as_error(self):
+        for tunnel_status in ("STOPPED", "STARTING", "NOT_READY"):
+            status = {
+                "version": "0.2.2",
+                "gateway": {"status": "HEALTHY", "endpoint": "http://127.0.0.1:8765", "server": {"version": "0.2.2"}},
+                "tunnel": {"status": tunnel_status, "profile": "codex-by-gpt", "healthUrl": "http://127.0.0.1:8080", "executable": "C:/tunnel-client.exe"},
+                "state": {},
+                "workspaces": [],
+            }
+            with mock.patch.object(self.runtime.shutil, "which", return_value="git"):
+                issues = self.runtime.diagnose(status)
+            self.assertTrue(any(issue["severity"] == "ERROR" for issue in issues), tunnel_status)
+
 
 if __name__ == "__main__":
     unittest.main()

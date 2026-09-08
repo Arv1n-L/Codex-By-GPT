@@ -80,6 +80,29 @@ The wait tool uses a bounded long poll. It does not actively wake an ended
 ChatGPT turn and does not introduce an external callback, queue, database, or
 service manager.
 
+## Local Service Manager
+
+The optional Service Manager supervises the Gateway, one Secure MCP tunnel
+client, and one serial Codex listener. Desired topology is persisted separately
+in `service.json`; observed state is in `service/runtime.json`; ownership is an
+OS-backed `service/supervisor.lock`. Workspace IDs are resolved through the
+existing registered-workspace authority and are never expanded implicitly.
+
+Startup is Gateway health, tunnel `/healthz` and `/readyz`, then listener.
+Child output is continuously drained into bounded rotating component logs.
+Crashes restart only the owned component with bounded backoff and a rolling
+failure budget. Stop requests carry the current supervisor `run_id`, preventing
+stale control files from stopping a later run; shutdown is listener, tunnel,
+gateway.
+
+On Windows, children are assigned to a Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` to prevent orphan processes. The MVP does
+not install a native SCM Windows Service; a future wrapper can host this same
+supervisor core when boot-before-login and supervisor self-recovery are needed.
+Only the API-key environment-variable name is stored; fixed argv and
+`shell=False` are used. Existing manual CLI and MCP/security boundaries remain
+unchanged, and conflicting external processes are rejected rather than adopted.
+
 ## Runtime observability
 
 `c2c status` reads the gateway health endpoint, observes the local tunnel

@@ -198,6 +198,32 @@ This is bounded long-polling, not an active callback that wakes an ended
 ChatGPT turn. The listener remains an explicit foreground process; service
 installation and multi-worker leases remain outside this release.
 
+## Service Manager (recommended Windows workflow)
+
+Configure the three long-running processes once, keeping the API key in the
+environment (only its variable name is persisted):
+
+```powershell
+c2c service configure `
+  --tunnel-id tunnel_xxx `
+  --workspace factory-Agent `
+  --api-key-env chatgpt-apikey `
+  --tunnel-client C:\path\to\tunnel-client.exe
+c2c service start
+```
+
+Use `c2c service status`, `c2c service logs`, `c2c service restart`, and
+`c2c service stop` for daily operation. The supervisor starts Gateway, waits
+for tunnel health/readiness, then starts the listener; child logs are bounded
+and failed children use bounded restart/backoff. Windows managed children are
+assigned to a Job Object to avoid orphan processes after a hard supervisor
+termination. `c2c service run` runs the same supervisor in the foreground for
+debugging. Native SCM Windows Service integration is intentionally deferred.
+
+Manual mode remains supported with `c2c gateway serve`, `tunnel-client run ...`,
+and `c2c codex listen --workspace ...`; conflicting manual processes are never
+adopted or killed.
+
 ## Runtime status and diagnosis
 
 Use `status` for a read-only snapshot of the gateway, tunnel readiness, selected

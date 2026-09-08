@@ -5,6 +5,8 @@ import os
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -35,6 +37,34 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(rows[0]["id"], result.id)
         self.assertTrue(self.mailbox.ack(result.id))
         self.assertEqual(self.mailbox.list_results(ws.id, "task-1"), [])
+
+    def test_gateway_health_and_unknown_get_routes(self):
+        import importlib
+        import codex_by_gpt.mcp as mcp
+        importlib.reload(mcp)
+        server = mcp.ThreadingHTTPServer(("127.0.0.1", 0), mcp.McpHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+
+        def get(path):
+            try:
+                with urllib.request.urlopen(base + path, timeout=2) as response:
+                    return response.status, response.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                return exc.code, exc.read().decode("utf-8")
+
+        try:
+            health_status, health_body = get("/healthz")
+            self.assertEqual(health_status, 200)
+            self.assertIn('"ok": true', health_body)
+            for path in ("/.well-known/oauth-protected-resource/mcp", "/.well-known/oauth-protected-resource", "/unknown"):
+                status, _body = get(path)
+                self.assertEqual(status, 404, path)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
 
     def test_exact_retry_reuses_original_result_even_after_ack(self):
         root = Path(self.tmp.name) / "a"; root.mkdir()

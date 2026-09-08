@@ -93,7 +93,7 @@ class McpHandler(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self._json(200, {"ok": True, "server": SERVER_INFO, "workspaces": len(list_workspaces())})
         else:
-            self._json(405, {"error": "Use POST /mcp"})
+            self._json(404, {"error": "Not found"})
     def do_DELETE(self) -> None:
         self._json(405, {"error": "Stateless server; DELETE is not supported"})
     def do_POST(self) -> None:

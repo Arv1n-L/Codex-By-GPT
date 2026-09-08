@@ -8,6 +8,16 @@ from .config import add_workspace, get_workspace, list_workspaces, remove_worksp
 from .mailbox import ack, list_results
 from .mcp import serve
 from .runtime import ListenerAlreadyActiveError, collect_status, doctor_report
+from .service import (
+    configure_service,
+    load_service_config,
+    read_logs,
+    restart_service,
+    run_service,
+    service_status,
+    start_service,
+    stop_service,
+)
 from .worker import listen
 
 
@@ -51,6 +61,27 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_p.add_argument("--host", default="127.0.0.1")
     doctor_p.add_argument("--port", type=int, default=8765)
     doctor_p.add_argument("--profile", default="codex-by-gpt")
+    service = sub.add_parser("service")
+    services = service.add_subparsers(dest="action", required=True)
+    configure = services.add_parser("configure")
+    configure.add_argument("--tunnel-id", required=True)
+    configure.add_argument("--workspace", required=True, action="append")
+    configure.add_argument("--api-key-env", default="chatgpt-apikey")
+    configure.add_argument("--tunnel-client")
+    configure.add_argument("--profile", default="codex-by-gpt")
+    configure.add_argument("--gateway-host", default="127.0.0.1")
+    configure.add_argument("--gateway-port", type=int, default=8765)
+    configure.add_argument("--tunnel-health-url", default="http://127.0.0.1:8080")
+    configure.add_argument("--poll-interval", type=float, default=1.0)
+    services.add_parser("start")
+    services.add_parser("stop")
+    services.add_parser("restart")
+    services.add_parser("status")
+    logs = services.add_parser("logs")
+    logs.add_argument("--component", choices=["supervisor", "gateway", "tunnel", "listener"], default="supervisor")
+    logs.add_argument("--lines", type=int, default=100)
+    logs.add_argument("--follow", action="store_true")
+    services.add_parser("run")
     return p
 
 
@@ -85,6 +116,31 @@ def main(argv=None) -> int:
         report = doctor_report(args.host, args.port, args.profile)
         emit(report)
         return 0 if report["ok"] else 1
+    if args.cmd == "service":
+        try:
+            if args.action == "configure":
+                emit(configure_service(args.tunnel_id, args.workspace, args.api_key_env, args.tunnel_client, args.profile, args.gateway_host, args.gateway_port, args.tunnel_health_url, args.poll_interval).to_dict())
+                return 0
+            if args.action == "start":
+                emit(start_service()); return 0
+            if args.action == "stop":
+                emit(stop_service()); return 0
+            if args.action == "restart":
+                emit(restart_service()); return 0
+            if args.action == "status":
+                emit(service_status()); return 0
+            if args.action == "logs":
+                if args.follow:
+                    for line in read_logs(args.component, args.lines, True):
+                        print(line, end="")
+                else:
+                    print(read_logs(args.component, args.lines, False), end="")
+                return 0
+            if args.action == "run":
+                return run_service()
+        except Exception as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
     return 2
 
 if __name__ == "__main__":

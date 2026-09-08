@@ -12,6 +12,12 @@ STATE_FILE = APP_DIR / "machine.json"
 MAILBOX_FILE = APP_DIR / "mailbox.jsonl"
 EXECUTIONS_FILE = APP_DIR / "executions.jsonl"
 EXECUTION_CLAIMS_FILE = APP_DIR / "execution_claims.jsonl"
+SERVICE_FILE = APP_DIR / "service.json"
+SERVICE_DIR = APP_DIR / "service"
+SERVICE_RUNTIME_FILE = SERVICE_DIR / "runtime.json"
+SERVICE_LOCK_FILE = SERVICE_DIR / "supervisor.lock"
+SERVICE_CONTROL_FILE = SERVICE_DIR / "control.json"
+LOG_DIR = APP_DIR / "logs"
 
 @dataclass(frozen=True)
 class WorkspaceConfig:
@@ -39,6 +45,23 @@ def save_state(state: dict[str, Any]) -> None:
     tmp = STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, STATE_FILE)
+
+
+def save_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    """Persist a small JSON state file without exposing a partial document."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def load_json_object(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected a JSON object: {path}")
+    return value
 
 
 def workspace_id(root: Path) -> str:

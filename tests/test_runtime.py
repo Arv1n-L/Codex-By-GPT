@@ -157,6 +157,35 @@ class RuntimeTest(unittest.TestCase):
         ), mock.patch.object(self.runtime, "_probe_tunnel_endpoint", side_effect=[(200, None), (200, None)]):
             self.assertEqual(self.runtime._tunnel_status("codex-by-gpt")["status"], "READY")
 
+    def test_detailed_tunnel_probe_captures_bounded_redacted_body(self):
+        os.environ["chatgpt-apikey"] = "probe-secret-value"
+
+        class Response:
+            status = 503
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, limit):
+                return ("reason=probe-secret-value " + ("x" * 100)).encode()
+
+        with mock.patch.object(self.runtime.urllib.request, "urlopen", return_value=Response()):
+            status, body, error = self.runtime._probe_tunnel_endpoint_detailed("http://127.0.0.1:8080/readyz", max_body_chars=32)
+        self.assertEqual(status, 503)
+        self.assertIsNone(error)
+        self.assertNotIn("probe-secret-value", body)
+        self.assertIn("<redacted>", body)
+        self.assertTrue(body.endswith("...<truncated>"))
+
+    def test_detailed_tunnel_probe_rejects_non_loopback(self):
+        status, body, error = self.runtime._probe_tunnel_endpoint_detailed("https://example.com/readyz")
+        self.assertIsNone(status)
+        self.assertIsNone(body)
+        self.assertEqual(error, "non-loopback URL rejected")
+
     def test_doctor_treats_stopped_or_unready_tunnel_as_error(self):
         for tunnel_status in ("STOPPED", "STARTING", "NOT_READY"):
             status = {

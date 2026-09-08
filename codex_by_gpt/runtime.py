@@ -3,11 +3,13 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -25,10 +27,12 @@ from .config import (
     WorkspaceConfig,
     list_workspaces,
 )
+from .mailbox import _redact_execution_output
 
 LISTENER_DIR = APP_DIR / "listeners"
 CLAIM_STALE_SECONDS = 2 * 60 * 60 + 60
 DEFAULT_TUNNEL_HEALTH_URL = "http://127.0.0.1:8080"
+MAX_TUNNEL_PROBE_BODY_CHARS = 2048
 _PROCESS_LOCK = RLock()
 _ACTIVE_LISTENERS: set[str] = set()
 
@@ -262,14 +266,43 @@ def _tunnel_executable() -> str | None:
     return shutil.which("tunnel-client")
 
 
-def _probe_tunnel_endpoint(url: str) -> tuple[int | None, str | None]:
+def _redact_probe_body(value: str) -> str:
+    redacted = value
+    for key, secret in os.environ.items():
+        if secret and len(secret) >= 8 and re.search(r"(?i)(api|key|token|secret|password|auth)", key):
+            redacted = redacted.replace(secret, "<redacted>")
+    return _redact_execution_output(redacted)
+
+
+def _probe_tunnel_endpoint_detailed(url: str, max_body_chars: int = MAX_TUNNEL_PROBE_BODY_CHARS) -> tuple[int | None, str | None, str | None]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return None, None, "non-loopback URL rejected"
+    limit = max(1, int(max_body_chars))
+
+    def read_body(response) -> str:
+        raw = response.read(limit + 1)
+        body = raw.decode("utf-8", errors="replace")
+        if len(body) > limit:
+            body = body[:limit] + "...<truncated>"
+        return _redact_probe_body(body)
+
     try:
         with urllib.request.urlopen(url, timeout=1.0) as response:
-            return response.status, None
+            return response.status, read_body(response), None
     except urllib.error.HTTPError as exc:
-        return exc.code, None
+        try:
+            body = read_body(exc)
+        except OSError:
+            body = None
+        return exc.code, body, None
     except (OSError, urllib.error.URLError) as exc:
-        return None, str(exc)
+        return None, None, str(exc)
+
+
+def _probe_tunnel_endpoint(url: str) -> tuple[int | None, str | None]:
+    status, _body, error = _probe_tunnel_endpoint_detailed(url)
+    return status, error
 
 
 def _tunnel_status(profile: str, health_url: str | None = None) -> dict[str, Any]:
@@ -355,13 +388,22 @@ def collect_status(host: str = "127.0.0.1", port: int = 8765, profile: str = "co
                 "lastExecution": last_execution,
             }
         )
-    return {
+    result = {
         "version": __version__,
         "gateway": _gateway_status(host, port),
         "tunnel": _tunnel_status(profile),
         "workspaces": workspace_rows,
         "state": {"machine.json": config_state, **state_files},
     }
+    # Service Manager is additive; manual mode remains unchanged when no config exists.
+    try:
+        from .service import service_status
+        service = service_status()
+        if service.get("configured"):
+            result["service"] = service
+    except (OSError, ValueError, RuntimeError, TypeError):
+        pass
+    return result
 
 
 def diagnose(status: dict[str, Any]) -> list[dict[str, str]]:
@@ -411,6 +453,24 @@ def diagnose(status: dict[str, Any]) -> list[dict[str, str]]:
                     "ABNORMAL_CLAIM",
                     f"workspace {workspace['name']} has {workspace['claims']} claim(s) requiring listener recovery",
                 )
+    service = status.get("service")
+    if service and service.get("configured"):
+        if service.get("status") == "INVALID":
+            add("ERROR", "SERVICE_CONFIG_INVALID", service.get("error", "service configuration is invalid"))
+        elif service.get("status") == "STOPPED":
+            add("ERROR", "SUPERVISOR_STOPPED", "service is configured but supervisor is not running")
+        elif service.get("status") == "FAILED":
+            add("ERROR", "SERVICE_COMPONENT_FAILED", "a managed service component has failed")
+        runtime = service.get("runtime") or {}
+        pid = runtime.get("supervisor_pid")
+        if runtime.get("status") == "RUNNING" and pid:
+            try:
+                from .service import _pid_alive
+                alive = _pid_alive(pid)
+            except (OSError, ValueError, TypeError):
+                alive = False
+            if not alive:
+                add("ERROR", "SUPERVISOR_STALE", "service runtime points to a stopped supervisor")
     return issues
 
 

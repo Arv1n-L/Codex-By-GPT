@@ -99,6 +99,32 @@ tunnel-client run --profile codex-by-gpt
 
 Then create **one** ChatGPT developer-mode app/connector using **Tunnel**, select that tunnel, and refresh its tool metadata while the local Gateway and tunnel client are healthy.
 
+Local MCP freshness is verified by the Gateway health check, MCP preflight, and a deterministic catalog digest. A local `MCP READY` result does not rewrite the action snapshot of an already-open ChatGPT conversation. If that conversation still shows old actions, refresh/reconnect the Codex-By-GPT app or start a new **NORMAL** ChatGPT conversation. This project does not operate ChatGPT UI, does not implement App Server lifecycle RPCs, and keeps `tools.listChanged` false.
+
+### Refreshing connector actions after an update
+
+Updating this repository or the remote plugin does not automatically replace the
+actions already mounted in an open ChatGPT conversation. Use this procedure:
+
+1. Confirm the local side is ready: run `c2c status` and, if needed, `c2c doctor`.
+   The Gateway must be healthy, the tunnel must be ready, and MCP preflight must
+   report `READY` with the current catalog digest.
+2. In ChatGPT, open the Codex-By-GPT app/connector settings (Settings → Apps or
+   Connectors, depending on the UI), select Codex-By-GPT, and choose **Refresh**
+   (or **Reconnect**, if the UI presents that label). This re-reads the current
+   `tools/list` metadata; it does not restart the local service.
+3. Return to the conversation. If its action list is still old, remove and
+   reselect the app/connector in that conversation, or start a new **NORMAL**
+   ChatGPT conversation and select Codex-By-GPT there. Do not use Work mode.
+4. Verify by asking ChatGPT to list or invoke a known current Codex-By-GPT
+   action. A successful local `MCP READY` check alone is not proof that the
+   current conversation has remounted its actions.
+
+If the connector cannot refresh, keep the local Gateway and tunnel running,
+repeat `c2c doctor`, then reconnect the connector before opening a new normal
+conversation. The project cannot click these ChatGPT controls on the user's
+behalf.
+
 ## MCP tools
 
 Read-only data plane:
@@ -168,6 +194,12 @@ continue with a new iteration. This conservative recovery may also suppress a
 safe retry if the listener stopped after claiming but before Codex started.
 The listener sweeps claims before the unacknowledged mailbox queue, so recovery
 still produces terminal evidence if the source row was already acknowledged.
+
+An execution claim is valid only when its `source_result_id` resolves to the
+same actionable mailbox row (`workspace_id`, `task_id`, `iteration`, `kind`, and
+non-empty payload). Missing or mismatched sources fail closed, and execution
+receipts retain that exact source ID. Ordinary text or an unlinked receipt
+therefore cannot authorize the runner.
 
 `task_id` plus `iteration` identifies one logical C2C step. An exact network
 retry reuses the original mailbox result, including after acknowledgement;
@@ -267,9 +299,10 @@ The Gateway rejects `..` path escapes, skips high-noise/private directories, and
 
 ## Status
 
-v0.2.2 enforces one listener per workspace with process-lifetime OS locks, adds
+v0.2.3 enforces one listener per workspace with process-lifetime OS locks, adds
 runtime status and diagnosis, and supports serial dispatch across multiple
-explicitly selected workspaces. Task-iteration idempotency and conservative
-claim recovery remain unchanged. Service installation, retention/compaction,
+explicitly selected workspaces. It also hardens mailbox source provenance and
+receipt deduplication so mismatched source IDs fail closed. Task-iteration
+idempotency and conservative claim recovery remain unchanged. Service installation, retention/compaction,
 short-lived per-session capabilities, and multi-worker leases remain outside
 this release.

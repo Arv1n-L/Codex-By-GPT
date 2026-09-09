@@ -58,6 +58,58 @@ class WorkerTest(unittest.TestCase):
         runner.assert_not_called()
         self.assertEqual(len(self.mailbox.list_results(self.ws.id, "task-2")), 1)
 
+    def test_invalid_mailbox_source_is_blocked_before_runner(self):
+        source = self.mailbox.submit(self.ws.id, "task-invalid-source", 1, "PLAN", "valid")
+        rows = self.mailbox._load()
+        rows[0]["payload"] = ""
+        self.mailbox._save(rows)
+        runner = mock.Mock()
+        self.assertTrue(self.worker.process_next(self.ws, runner))
+        runner.assert_not_called()
+        receipt = self.mailbox.wait_for_execution(self.ws.id, "task-invalid-source", 1)
+        self.assertEqual(receipt["state"], "BLOCKED")
+        self.assertIn("invalid mailbox execution source", receipt["record"]["execution_output"])
+        self.assertEqual(receipt["record"]["source_result_id"], source.id)
+
+    def test_runner_receives_the_source_revalidated_after_claim(self):
+        source = self.mailbox.submit(self.ws.id, "task-revalidated-source", 1, "PLAN", "listed payload")
+        original_claim = self.mailbox.claim_execution
+
+        def claim_then_update(*args):
+            claim = original_claim(*args)
+            rows = self.mailbox._load()
+            rows[0]["payload"] = "validated payload"
+            self.mailbox._save(rows)
+            return claim
+
+        runner = mock.Mock(
+            return_value=self.worker.ExecutionOutcome(
+                0, "done", {"status": "passed", "command": "tests", "summary": "ok"}
+            )
+        )
+        with mock.patch.object(self.worker, "claim_execution", side_effect=claim_then_update):
+            self.assertTrue(self.worker.process_next(self.ws, runner))
+
+        self.assertEqual(runner.call_args.args[1]["id"], source.id)
+        self.assertEqual(runner.call_args.args[1]["payload"], "validated payload")
+
+    def test_cancellation_during_source_revalidation_preserves_cancelled_receipt(self):
+        source = self.mailbox.submit(self.ws.id, "task-revalidation-cancel", 1, "PLAN", "plan")
+        original_validate = self.worker.validate_execution_source
+
+        def cancel_then_validate(*args, **kwargs):
+            self.mailbox.cancel_result(source.id, "cancel during validation")
+            return original_validate(*args, **kwargs)
+
+        runner = mock.Mock()
+        with mock.patch.object(self.worker, "validate_execution_source", side_effect=cancel_then_validate):
+            self.assertTrue(self.worker.process_next(self.ws, runner))
+
+        runner.assert_not_called()
+        receipt = self.mailbox.wait_for_execution(self.ws.id, "task-revalidation-cancel", 1)
+        self.assertEqual(receipt["state"], "CANCELLED")
+        self.assertIsNone(self.mailbox.get_execution_claim(self.ws.id, "task-revalidation-cancel", 1))
+
     def test_cancelled_result_is_not_run(self):
         source = self.mailbox.submit(self.ws.id, "task-cancel", 1, "PLAN", "do it")
         self.mailbox.cancel_result(source.id, "quota exhausted")

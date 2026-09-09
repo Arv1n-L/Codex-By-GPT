@@ -541,6 +541,56 @@ class ServiceSupervisor:
             time.sleep(0.2)
         return False
 
+    def _wait_gateway_ready(self, timeout: float = 30.0) -> bool:
+        """Wait for Gateway health and verify its live MCP catalog."""
+        if not self._wait_gateway(timeout):
+            return False
+        mcp = _mcp_preflight(self.config.gateway_host, self.config.gateway_port)
+        if mcp.get("status") != "READY":
+            self._log(f"gateway MCP preflight failed code={mcp.get('code', 'MCP_PREFLIGHT_FAILED')}")
+            return False
+        return True
+
+    def _hold_tunnel_for_gateway_restart(self) -> None:
+        """Keep the remote tunnel closed until a restarted Gateway is ready."""
+        tunnel = self.children.get("tunnel")
+        if not tunnel or tunnel.state not in {"RUNNING", "BACKOFF"}:
+            return
+        self._terminate(tunnel)
+        tunnel.process = None
+        tunnel.state = "BACKOFF"
+        tunnel.next_restart = float("inf")
+        tunnel.last_transition = _now()
+        self._log("tunnel held until gateway MCP preflight is ready")
+
+    def _release_tunnel_after_gateway_ready(self) -> None:
+        tunnel = self.children.get("tunnel")
+        if tunnel and tunnel.process is None and tunnel.state == "BACKOFF" and tunnel.next_restart == float("inf"):
+            tunnel.next_restart = 0.0
+            tunnel.last_transition = _now()
+
+    def _restart_child(self, child: _Child) -> None:
+        child.next_restart = 0.0
+        child.restarts += 1
+        if child.name == "gateway":
+            self._hold_tunnel_for_gateway_restart()
+        self._spawn(child)
+        ready = child.name == "gateway" and self._wait_gateway_ready() or child.name == "tunnel" and self._wait_tunnel() or child.name == "listener"
+        if not ready:
+            self._terminate(child)
+            child.process = None
+            failure_now = time.monotonic()
+            child.failures = [stamp for stamp in child.failures if failure_now - stamp <= float(self.config.restart["failure_window_seconds"])]
+            child.failures.append(failure_now)
+            child.state = "FAILED" if not self.config.restart.get("enabled", True) or len(child.failures) >= int(self.config.restart["max_failures"]) else "BACKOFF"
+            delay = min(float(self.config.restart["max_delay_seconds"]), float(self.config.restart["initial_delay_seconds"]) * (2 ** child.restarts))
+            child.next_restart = failure_now + delay
+        else:
+            child.state = "RUNNING"
+            if child.name == "gateway":
+                self._release_tunnel_after_gateway_ready()
+        self._persist(self._overall_status())
+
     def _wait_tunnel(self, timeout: float = 60.0) -> bool:
         deadline = time.monotonic() + timeout
         url = self.config.tunnel_health_url.rstrip("/")
@@ -605,12 +655,8 @@ class ServiceSupervisor:
                 _clear_control()
                 self._persist("STARTING")
                 self._spawn(self.children["gateway"])
-                if not self._wait_gateway(): raise RuntimeError("gateway did not become HEALTHY")
+                if not self._wait_gateway_ready(): raise RuntimeError("gateway did not become MCP READY")
                 self.children["gateway"].state = "RUNNING"
-                mcp = _mcp_preflight(self.config.gateway_host, self.config.gateway_port)
-                if mcp.get("status") != "READY":
-                    code = mcp.get("code", "MCP_PREFLIGHT_FAILED")
-                    raise RuntimeError(f"{code}: {mcp.get('message', 'local MCP preflight failed')}")
                 self._spawn(self.children["tunnel"])
                 if not self._wait_tunnel(): raise RuntimeError("tunnel did not become READY")
                 self.children["tunnel"].state = "RUNNING"
@@ -631,22 +677,7 @@ class ServiceSupervisor:
                 for child in self.children.values():
                     if child.process is None:
                         if child.state == "BACKOFF" and now >= child.next_restart:
-                            child.next_restart = 0.0
-                            child.restarts += 1
-                            self._spawn(child)
-                            ready = child.name == "gateway" and self._wait_gateway() or child.name == "tunnel" and self._wait_tunnel() or child.name == "listener"
-                            if not ready:
-                                self._terminate(child)
-                                child.process = None
-                                failure_now = time.monotonic()
-                                child.failures = [stamp for stamp in child.failures if failure_now - stamp <= float(self.config.restart["failure_window_seconds"])]
-                                child.failures.append(failure_now)
-                                child.state = "FAILED" if not self.config.restart.get("enabled", True) or len(child.failures) >= int(self.config.restart["max_failures"]) else "BACKOFF"
-                                delay = min(float(self.config.restart["max_delay_seconds"]), float(self.config.restart["initial_delay_seconds"]) * (2 ** child.restarts))
-                                child.next_restart = failure_now + delay
-                            else:
-                                child.state = "RUNNING"
-                            self._persist(self._overall_status())
+                            self._restart_child(child)
                         continue
                     code = child.process.poll()
                     if code is None: continue
@@ -659,6 +690,8 @@ class ServiceSupervisor:
                     child.state = "FAILED" if not self.config.restart.get("enabled", True) or len(child.failures) >= int(self.config.restart["max_failures"]) else "BACKOFF"
                     child.last_transition = _now()
                     self._log(f"exit component={child.name} code={code} restart_count={child.restarts}")
+                    if child.name == "gateway":
+                        self._hold_tunnel_for_gateway_restart()
                     if child.state == "FAILED" or not self.config.restart.get("enabled", True):
                         self._persist("FAILED")
                         continue

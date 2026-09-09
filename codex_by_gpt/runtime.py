@@ -28,7 +28,7 @@ from .config import (
     list_workspaces,
 )
 from .mailbox import _redact_execution_output
-from .mcp import TOOLS as MCP_TOOLS
+from .mcp import MCP_CATALOG_DIGEST, TOOLS as MCP_TOOLS, tool_catalog_digest
 
 LISTENER_DIR = APP_DIR / "listeners"
 CLAIM_STALE_SECONDS = 2 * 60 * 60 + 60
@@ -296,16 +296,20 @@ def _mcp_preflight(host: str = "127.0.0.1", port: int = 8765) -> dict[str, Any]:
         if any(not isinstance(name, str) or not name for name in names) or len(set(names)) != len(names):
             return {"status": "FAILED", "code": "MCP_CATALOG_INVALID", "endpoint": endpoint, "message": "tools/list contains invalid or duplicate tool names"}
         by_name = {tool["name"]: tool for tool in tools}
+        actual_catalog_digest = tool_catalog_digest(tools)
+        expected_catalog_digest = MCP_CATALOG_DIGEST
         missing = sorted(CORE_MCP_TOOLS - set(names))
         if missing:
-            return {"status": "FAILED", "code": "ACTION_SET_INCOMPLETE", "endpoint": endpoint, "missing": missing}
+            return {"status": "FAILED", "code": "ACTION_SET_INCOMPLETE", "endpoint": endpoint, "missing": missing, "expectedCatalogDigest": expected_catalog_digest, "actualCatalogDigest": actual_catalog_digest}
         invalid = []
         for name, expected in EXPECTED_MCP_TOOLS.items():
             actual = by_name.get(name)
             if not isinstance(actual, dict) or actual.get("inputSchema") != expected.get("inputSchema") or actual.get("annotations") != expected.get("annotations"):
                 invalid.append(name)
         if invalid:
-            return {"status": "FAILED", "code": "MCP_CATALOG_INVALID", "endpoint": endpoint, "invalid": sorted(invalid)}
+            return {"status": "FAILED", "code": "MCP_CATALOG_INVALID", "endpoint": endpoint, "invalid": sorted(invalid), "expectedCatalogDigest": expected_catalog_digest, "actualCatalogDigest": actual_catalog_digest}
+        if actual_catalog_digest != expected_catalog_digest:
+            return {"status": "FAILED", "code": "MCP_CATALOG_MISMATCH", "endpoint": endpoint, "expectedCatalogDigest": expected_catalog_digest, "actualCatalogDigest": actual_catalog_digest, "message": "Gateway MCP catalog digest does not match the local package"}
         workspace_result = call(3, "tools/call", {"name": "workspace_list", "arguments": {}})
         content = workspace_result.get("content")
         if not isinstance(content, list) or not content or not isinstance(content[0], dict):
@@ -321,6 +325,8 @@ def _mcp_preflight(host: str = "127.0.0.1", port: int = 8765) -> dict[str, Any]:
             "server": server,
             "toolNames": sorted(names),
             "workspaceCount": len(workspaces["workspaces"]),
+            "mcpCatalogDigest": actual_catalog_digest,
+            "expectedCatalogDigest": expected_catalog_digest,
         }
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, urllib.error.URLError, RuntimeError, TypeError, ValueError) as exc:
         return {"status": "FAILED", "code": "MCP_CALL_FAILED", "endpoint": endpoint, "message": str(exc)}
@@ -517,7 +523,9 @@ def diagnose(status: dict[str, Any]) -> list[dict[str, str]]:
             message = f"missing MCP actions: {', '.join(mcp['missing'])}"
         add("ERROR", code, message)
     elif mcp and mcp.get("status") == "READY":
-        add("INFO", "CLIENT_ACTIONS_UNVERIFIED", "local MCP is ready; the current ChatGPT session still requires connector refresh or a new chat to verify action mounting")
+        digest = mcp.get("mcpCatalogDigest") or mcp.get("expectedCatalogDigest") or "unknown"
+        add("INFO", "LOCAL_MCP_READY", f"local MCP catalog is current: {digest}")
+        add("INFO", "CLIENT_ACTIONS_UNVERIFIED", "local MCP is current, but an already-open ChatGPT conversation may still hold an older mounted action snapshot; refresh/reconnect the app or start a new normal chat if actions are stale")
     tunnel = status["tunnel"]
     if tunnel["status"] == "UNAVAILABLE":
         add("ERROR", "TUNNEL_CLIENT_NOT_FOUND", "tunnel-client is not running and its executable was not found")

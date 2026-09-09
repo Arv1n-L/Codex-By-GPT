@@ -26,7 +26,7 @@ Codex is the executor. It remains responsible for file edits, shell commands, te
 
 ## Execution loop
 
-The v0.2.2 listener processes only unacknowledged `PLAN` and `REVIEW` mailbox
+The v0.2.3 listener processes only unacknowledged `PLAN` and `REVIEW` mailbox
 records for explicitly selected registered workspaces. It fixes each Codex run
 to that workspace root, records bounded stdout/stderr and a schema-constrained
 test status in `executions.jsonl`, and acknowledges the source result only after
@@ -43,6 +43,13 @@ The single-listener execution lifecycle is:
 ```text
 durable claim -> run Codex -> durable terminal execution -> clear claim -> ack source
 ```
+
+The mailbox source is a hard execution boundary: a claim or `EXECUTED` receipt
+must reference an existing actionable source row with the same workspace, task,
+iteration, kind, and non-empty payload. Missing, mismatched, or malformed
+sources fail closed before the runner starts. Terminal `BLOCKED` or cancellation
+receipts may still reference an invalid payload so the rejection remains
+auditable, but they cannot authorize execution.
 
 Claims are internal JSONL machine state keyed by
 `(workspace_id, task_id, iteration)`. A claim that survives without a terminal
@@ -102,6 +109,36 @@ supervisor core when boot-before-login and supervisor self-recovery are needed.
 Only the API-key environment-variable name is stored; fixed argv and
 `shell=False` are used. Existing manual CLI and MCP/security boundaries remain
 unchanged, and conflicting external processes are rejected rather than adopted.
+
+## Connector action snapshot lifecycle
+
+The local Gateway loads its MCP catalog when the process starts. Service
+readiness therefore follows this sequence:
+
+```text
+Gateway health -> MCP initialize/tools/list/workspace preflight
+              -> catalog digest matches -> LOCAL_MCP_READY
+```
+
+ChatGPT may independently retain an action-metadata snapshot for a conversation
+that was already open. `LOCAL_MCP_READY` does not acknowledge that client-side
+snapshot. After a plugin or catalog update, the operator must:
+
+1. Run `c2c status` (and `c2c doctor` when diagnosing a failure) and confirm the
+   Gateway, tunnel, and MCP preflight are ready.
+2. Open the Codex-By-GPT connector settings in ChatGPT and select **Refresh** or
+   **Reconnect** so the connector reads the current MCP metadata.
+3. If the existing conversation still exposes old actions, reselect the app in
+   that conversation or start a new **NORMAL** ChatGPT conversation. Work mode is
+   not part of this workflow.
+4. Verify a current action is visible or callable. Do not treat local readiness
+   alone as proof of client remounting.
+
+This repository does not operate ChatGPT UI, implement an App Server lifecycle or
+MCP-reload RPC, or advertise dynamic tool notifications; `tools.listChanged`
+remains `false`. Connector refresh is consequently a client operation, while
+Gateway restart and catalog preflight are local operations supervised by this
+project.
 
 ## Runtime observability
 

@@ -16,6 +16,7 @@ from typing import Any, Iterator
 from .config import APP_DIR, EXECUTION_CLAIMS_FILE, EXECUTIONS_FILE, MAILBOX_FILE
 
 ALLOWED_KINDS = {"PLAN", "REVIEW", "DONE", "BLOCKED", "RESEARCH"}
+ACTIONABLE_KINDS = {"PLAN", "REVIEW"}
 MAX_PAYLOAD_CHARS = 64_000
 MAX_EXECUTION_OUTPUT_CHARS = 256_000
 MAX_TEST_FIELD_CHARS = 4_000
@@ -149,8 +150,12 @@ def _save(rows: list[dict[str, Any]]) -> None:
 def submit(workspace_id: str, task_id: str, iteration: int, kind: str, payload: str) -> Result:
     if kind not in ALLOWED_KINDS:
         raise ValueError(f"kind must be one of {sorted(ALLOWED_KINDS)}")
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ValueError("task_id must be a non-empty string")
     if iteration < 0:
         raise ValueError("iteration must be >= 0")
+    if not isinstance(payload, str) or not payload.strip():
+        raise ValueError("payload must be a non-empty string")
     if len(payload) > MAX_PAYLOAD_CHARS:
         raise ValueError("payload too large")
     with _locked(MAILBOX_FILE):
@@ -172,6 +177,32 @@ def submit(workspace_id: str, task_id: str, iteration: int, kind: str, payload: 
 def list_results(workspace_id: str | None = None, task_id: str | None = None, include_acked: bool = False) -> list[dict[str, Any]]:
     rows = _load()
     return [r for r in rows if (include_acked or not r.get("acked")) and (workspace_id is None or r["workspace_id"] == workspace_id) and (task_id is None or r["task_id"] == task_id)]
+
+
+def validate_execution_source(
+    workspace_id: str,
+    task_id: str,
+    iteration: int,
+    source_result_id: str,
+    *,
+    require_actionable: bool,
+    validate_payload: bool = True,
+) -> dict[str, Any]:
+    """Return the exact mailbox source or fail closed before execution/evidence."""
+    if not source_result_id:
+        raise ValueError("source_result_id is required")
+    source = next((row for row in _load() if row["id"] == source_result_id), None)
+    if source is None:
+        raise ValueError("source mailbox result not found")
+    if _logical_key(source) != (workspace_id, task_id, int(iteration)):
+        raise ValueError("source mailbox result does not match the logical task iteration")
+    if (require_actionable or validate_payload) and source.get("kind") not in ACTIONABLE_KINDS:
+        raise ValueError("source mailbox result is not actionable")
+    if validate_payload and (not isinstance(source.get("payload"), str) or not source["payload"].strip()):
+        raise ValueError("source mailbox payload must be a non-empty string")
+    if require_actionable and (source.get("acked") or source.get("cancelled") or source.get("blocked")):
+        raise ValueError("source mailbox result is no longer actionable")
+    return source
 
 
 def ack(result_id: str) -> bool:
@@ -250,8 +281,6 @@ def list_execution_claims(workspace_id: str | None = None) -> list[dict[str, Any
 def claim_execution(workspace_id: str, task_id: str, iteration: int, source_result_id: str) -> ExecutionClaim:
     if iteration < 0:
         raise ValueError("iteration must be >= 0")
-    if not source_result_id:
-        raise ValueError("source_result_id is required")
     with _locked(EXECUTION_CLAIMS_FILE):
         rows = _load_execution_claims()
         key = (workspace_id, task_id, iteration)
@@ -260,6 +289,7 @@ def claim_execution(workspace_id: str, task_id: str, iteration: int, source_resu
             if existing["source_result_id"] != source_result_id:
                 raise RuntimeError("logical task iteration is already claimed by a different mailbox result")
             return ExecutionClaim(**existing)
+        validate_execution_source(workspace_id, task_id, iteration, source_result_id, require_actionable=True)
         claim = ExecutionClaim(workspace_id, task_id, iteration, source_result_id, time.time())
         rows.append(asdict(claim))
         _save_execution_claims(rows)
@@ -321,16 +351,34 @@ def record_execution(
 ) -> ExecutionRecord:
     if iteration < 0:
         raise ValueError("iteration must be >= 0")
-    if not source_result_id:
-        raise ValueError("source_result_id is required")
+    if state not in {"EXECUTED", "CANCELLED", "SUPERSEDED", "BLOCKED"}:
+        raise ValueError("invalid execution state")
+    # Resolve the exact source before any logical-key deduplication.  An old
+    # receipt must not make an unrelated source_result_id look authorized.
+    validate_execution_source(
+        workspace_id,
+        task_id,
+        iteration,
+        source_result_id,
+        require_actionable=False,
+        validate_payload=False,
+    )
     with _locked(EXECUTIONS_FILE):
         rows = _load_executions()
         key = (workspace_id, task_id, iteration)
         existing = next((row for row in reversed(rows) if _logical_key(row) == key), None)
-        if not existing:
-            existing = next((row for row in reversed(rows) if row["source_result_id"] == source_result_id), None)
         if existing:
+            if existing["source_result_id"] != source_result_id:
+                raise ValueError("logical task iteration already has a receipt for a different source_result_id")
             return ExecutionRecord(**existing)
+        validate_execution_source(
+            workspace_id,
+            task_id,
+            iteration,
+            source_result_id,
+            require_actionable=False,
+            validate_payload=state == "EXECUTED",
+        )
         clipped_output = _redact_execution_output(str(execution_output))[:MAX_EXECUTION_OUTPUT_CHARS]
         normalized_test_status = _normalize_test_status(test_status)
         if codex_exit_code not in {None, 0} and normalized_test_status["status"] == "passed":
@@ -339,8 +387,6 @@ def record_execution(
                 "status": "unknown",
                 "summary": "Codex exited non-zero; a passing test claim cannot be trusted.",
             }
-        if state not in {"EXECUTED", "CANCELLED", "SUPERSEDED", "BLOCKED"}:
-            raise ValueError("invalid execution state")
         record = ExecutionRecord(
             id=str(uuid.uuid4()),
             workspace_id=workspace_id,

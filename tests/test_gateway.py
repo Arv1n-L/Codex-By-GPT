@@ -101,9 +101,10 @@ class GatewayTest(unittest.TestCase):
         cancelled = self.mailbox.cancel_result(first.id, "SUPERSEDED by iteration 2")
         self.assertEqual(cancelled.state, "SUPERSEDED")
         self.assertEqual(self.mailbox.list_results(ws.id, "task-supersede", include_acked=True)[1]["payload"], "new")
-        self.mailbox.record_execution(ws.id, "task-done", 1, "done-source", 0, "done", {"status": "passed"})
+        done_source = self.mailbox.submit(ws.id, "task-done", 1, "PLAN", "done")
+        self.mailbox.record_execution(ws.id, "task-done", 1, done_source.id, 0, "done", {"status": "passed"})
         with self.assertRaisesRegex(RuntimeError, "EXECUTED"):
-            self.mailbox.cancel_result("done-source", "too late")
+            self.mailbox.cancel_result(done_source.id, "too late")
         self.assertEqual(self.mailbox.list_results(ws.id, "task-retry"), [])
 
     def test_block_result_is_terminal_and_idempotent(self):
@@ -172,6 +173,11 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(len(first.execution_output), self.mailbox.MAX_EXECUTION_OUTPUT_CHARS)
         self.assertEqual(first.test_status["status"], "passed")
         self.assertEqual(self.mailbox.list_results(ws.id, "task-2")[0]["id"], source.id)
+        rows = self.mailbox._load()
+        alternate = {**rows[0], "id": "source-2", "created_at": rows[0]["created_at"] + 1}
+        self.mailbox._save([*rows, alternate])
+        with self.assertRaisesRegex(ValueError, "different source_result_id"):
+            self.mailbox.record_execution(ws.id, "task-2", 1, "source-2", 0, "replay", {"status": "passed"})
         failed_source = self.mailbox.submit(ws.id, "task-failed", 2, "PLAN", "change it")
         failed = self.mailbox.record_execution(
             ws.id,
@@ -184,33 +190,88 @@ class GatewayTest(unittest.TestCase):
         )
         self.assertEqual(failed.test_status["status"], "unknown")
 
+    def test_execution_receipt_requires_matching_mailbox_source(self):
+        root = Path(self.tmp.name) / "a"; root.mkdir()
+        ws = self.config.add_workspace(str(root))
+        source = self.mailbox.submit(ws.id, "task-source", 1, "PLAN", "plan")
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self.mailbox.record_execution(ws.id, "other-task", 1, source.id, 0, "done", {"status": "passed"})
+        with self.assertRaisesRegex(ValueError, "not found"):
+            self.mailbox.record_execution(ws.id, "task-source", 1, "missing-source", 0, "done", {"status": "passed"})
+
+    def test_execution_receipt_retry_returns_immutable_record_after_source_changes(self):
+        root = Path(self.tmp.name) / "a"; root.mkdir()
+        ws = self.config.add_workspace(str(root))
+        source = self.mailbox.submit(ws.id, "task-receipt", 1, "PLAN", "plan")
+        first = self.mailbox.record_execution(
+            ws.id, "task-receipt", 1, source.id, 0, "done", {"status": "passed"}
+        )
+        rows = self.mailbox._load()
+        rows[0]["payload"] = ""
+        self.mailbox._save(rows)
+
+        retry = self.mailbox.record_execution(
+            ws.id, "task-receipt", 1, source.id, 1, "different", {"status": "failed"}
+        )
+
+        self.assertEqual(retry, first)
+        self.assertEqual(len(self.mailbox._load_executions()), 1)
+
     def test_execution_claim_is_durable_idempotent_and_clearable(self):
         root = Path(self.tmp.name) / "a"; root.mkdir()
         ws = self.config.add_workspace(str(root))
-        first = self.mailbox.claim_execution(ws.id, "task-claim", 1, "source-1")
-        retry = self.mailbox.claim_execution(ws.id, "task-claim", 1, "source-1")
+        source = self.mailbox.submit(ws.id, "task-claim", 1, "PLAN", "claim")
+        rows = self.mailbox._load()
+        duplicate = {**rows[0], "id": "source-2", "created_at": rows[0]["created_at"] + 1}
+        self.mailbox._save([*rows, duplicate])
+        first = self.mailbox.claim_execution(ws.id, "task-claim", 1, source.id)
+        retry = self.mailbox.claim_execution(ws.id, "task-claim", 1, source.id)
         self.assertEqual(retry.created_at, first.created_at)
-        self.assertEqual(
-            self.mailbox.get_execution_claim(ws.id, "task-claim", 1)["source_result_id"],
-            "source-1",
-        )
+        self.assertEqual(self.mailbox.get_execution_claim(ws.id, "task-claim", 1)["source_result_id"], source.id)
         with self.assertRaisesRegex(RuntimeError, "different mailbox result"):
             self.mailbox.claim_execution(ws.id, "task-claim", 1, "source-2")
         self.assertTrue(self.mailbox.clear_execution_claim(ws.id, "task-claim", 1))
         self.assertIsNone(self.mailbox.get_execution_claim(ws.id, "task-claim", 1))
         self.assertFalse(self.mailbox.clear_execution_claim(ws.id, "task-claim", 1))
 
-    def test_execution_record_deduplicates_by_logical_iteration(self):
+    def test_execution_claim_rejects_missing_or_mismatched_mailbox_source(self):
         root = Path(self.tmp.name) / "a"; root.mkdir()
         ws = self.config.add_workspace(str(root))
+        other = self.mailbox.submit(ws.id, "other-task", 1, "PLAN", "other")
+
+        with self.assertRaisesRegex(ValueError, "not found"):
+            self.mailbox.claim_execution(ws.id, "task-bound", 1, "missing-source")
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self.mailbox.claim_execution(ws.id, "task-bound", 1, other.id)
+
+        self.assertEqual(self.mailbox.list_execution_claims(ws.id), [])
+
+    def test_execution_claim_retry_returns_durable_claim_after_source_is_acked(self):
+        root = Path(self.tmp.name) / "a"; root.mkdir()
+        ws = self.config.add_workspace(str(root))
+        source = self.mailbox.submit(ws.id, "task-claimed", 1, "PLAN", "plan")
+        first = self.mailbox.claim_execution(ws.id, "task-claimed", 1, source.id)
+        self.assertTrue(self.mailbox.ack(source.id))
+
+        retry = self.mailbox.claim_execution(ws.id, "task-claimed", 1, source.id)
+
+        self.assertEqual(retry, first)
+
+    def test_execution_receipt_rejects_different_source_for_logical_iteration(self):
+        root = Path(self.tmp.name) / "a"; root.mkdir()
+        ws = self.config.add_workspace(str(root))
+        source = self.mailbox.submit(ws.id, "task-logical", 4, "PLAN", "first")
+        rows = self.mailbox._load()
+        duplicate_source = {**rows[0], "id": "source-2", "created_at": rows[0]["created_at"] + 1}
+        self.mailbox._save([*rows, duplicate_source])
         first = self.mailbox.record_execution(
-            ws.id, "task-logical", 4, "source-1", 0, "first", {"status": "passed"}
+            ws.id, "task-logical", 4, source.id, 0, "first", {"status": "passed"}
         )
-        duplicate = self.mailbox.record_execution(
-            ws.id, "task-logical", 4, "source-2", 1, "second", {"status": "failed"}
-        )
-        self.assertEqual(duplicate.id, first.id)
-        self.assertEqual(duplicate.source_result_id, "source-1")
+        with self.assertRaisesRegex(ValueError, "different source_result_id"):
+            self.mailbox.record_execution(
+                ws.id, "task-logical", 4, "source-2", 1, "second", {"status": "failed"}
+            )
+        self.assertEqual(self.mailbox.execution_for_source(source.id)["id"], first.id)
         self.assertEqual(len(self.mailbox._load_executions()), 1)
 
     def test_mailbox_submit_and_ack_are_serialized(self):
@@ -254,11 +315,12 @@ class GatewayTest(unittest.TestCase):
     def test_execution_output_redacts_secrets_before_persistence(self):
         root = Path(self.tmp.name) / "a"; root.mkdir()
         ws = self.config.add_workspace(str(root))
+        source = self.mailbox.submit(ws.id, "task-secret", 1, "PLAN", "redact")
         record = self.mailbox.record_execution(
             ws.id,
             "task-secret",
             1,
-            "source-secret",
+            source.id,
             0,
             "API_KEY=top-secret\nAuthorization: Bearer abcdefghijklmnop\nsk-example123456789\nordinary output",
             {
@@ -285,7 +347,8 @@ class GatewayTest(unittest.TestCase):
         root = Path(self.tmp.name) / "a"; root.mkdir()
         ws = self.config.add_workspace(str(root))
         self.assertEqual(self.mailbox.wait_for_execution(ws.id, "task-3", 1)["state"], "PENDING")
-        self.mailbox.record_execution(ws.id, "task-3", 1, "source-3", 1, "failed", {"status": "invalid"})
+        source = self.mailbox.submit(ws.id, "task-3", 1, "PLAN", "failed")
+        self.mailbox.record_execution(ws.id, "task-3", 1, source.id, 1, "failed", {"status": "invalid"})
         result = self.mailbox.wait_for_execution(ws.id, "task-3", 1)
         self.assertEqual(result["state"], "EXECUTED")
         self.assertEqual(result["record"]["test_status"]["status"], "unknown")

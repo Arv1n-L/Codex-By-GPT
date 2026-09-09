@@ -25,6 +25,7 @@ from .mailbox import (
     is_cancelled,
     set_execution_claim_process,
     block_result,
+    validate_execution_source,
 )
 from .runtime import listener_ownership
 
@@ -305,7 +306,23 @@ def process_next(cfg: WorkspaceConfig, runner: Runner = run_codex) -> bool:
             if not ack(result["id"]):
                 raise RuntimeError(f"Could not acknowledge interrupted mailbox result {result['id']}")
             return True
-        claim_execution(cfg.id, result["task_id"], int(result["iteration"]), result["id"])
+        try:
+            claim_execution(cfg.id, result["task_id"], int(result["iteration"]), result["id"])
+            result = validate_execution_source(
+                cfg.id,
+                result["task_id"],
+                int(result["iteration"]),
+                result["id"],
+                require_actionable=True,
+            )
+        except ValueError as exc:
+            try:
+                block_result(result["id"], f"BLOCKED: invalid mailbox execution source ({exc})")
+            except RuntimeError:
+                if execution_for_source(result["id"]) is None:
+                    raise
+            clear_execution_claim(cfg.id, result["task_id"], int(result["iteration"]))
+            return True
         if _forbidden_work_intent(result.get("payload")):
             block_result(result["id"], _block_reason(result))
             clear_execution_claim(cfg.id, result["task_id"], int(result["iteration"]))

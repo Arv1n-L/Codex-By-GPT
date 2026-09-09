@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
+from .browser_target import BrowserTargetError, select_preferred_target, target_dict
 from .config import add_workspace, get_workspace, list_workspaces, remove_workspace
 from .mailbox import ack, cancel_result, list_results
 from .mcp import serve
@@ -54,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
     tuns = tun.add_subparsers(dest="action", required=True)
     init = tuns.add_parser("init-command"); init.add_argument("--tunnel-id", required=True); init.add_argument("--profile", default="codex-by-gpt"); init.add_argument("--port", type=int, default=8765)
     run = tuns.add_parser("run-command"); run.add_argument("--profile", default="codex-by-gpt")
+    browser = sub.add_parser("browser-target", help="Select a safe target from a Codex host browser inventory")
+    browsers = browser.add_subparsers(dest="action", required=True)
+    select = browsers.add_parser("select")
+    select.add_argument("--inventory", required=True, help="JSON file produced by the Codex browser host adapter")
+    select.add_argument("--active-tab-id")
     status_p = sub.add_parser("status")
     status_p.add_argument("--host", default="127.0.0.1")
     status_p.add_argument("--port", type=int, default=8765)
@@ -111,6 +118,15 @@ def main(argv=None) -> int:
         if args.action == "init-command":
             emit({"env": "CONTROL_PLANE_API_KEY=<runtime-key>", "command": f'tunnel-client init --sample sample_mcp_stdio_local --profile {args.profile} --tunnel-id {args.tunnel_id} --mcp-server-url http://127.0.0.1:{args.port}/mcp', "then": f"tunnel-client doctor --profile {args.profile} --explain"}); return 0
         if args.action == "run-command": emit({"command": f"tunnel-client run --profile {args.profile}"}); return 0
+    if args.cmd == "browser-target" and args.action == "select":
+        try:
+            inventory = json.loads(Path(args.inventory).read_text(encoding="utf-8"))
+            tabs = inventory.get("tabs", []) if isinstance(inventory, dict) else inventory
+            emit({"selected": target_dict(select_preferred_target(tabs, args.active_tab_id)), "requires_host_revalidation": True})
+            return 0
+        except (OSError, json.JSONDecodeError, BrowserTargetError, TypeError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
     if args.cmd == "status":
         emit(collect_status(args.host, args.port, args.profile))
         return 0

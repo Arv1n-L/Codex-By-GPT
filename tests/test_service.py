@@ -180,6 +180,57 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual(supervisor.run(), 1)
         self.assertEqual(spawned, ["gateway"])
 
+    def test_gateway_readiness_requires_mcp_preflight(self):
+        cfg = self.service.ServiceConfig("tunnel_x", [self.ws.id], tunnel_client=str(self.tunnel))
+        supervisor = self.service.ServiceSupervisor(cfg)
+        with mock.patch.object(supervisor, "_wait_gateway", return_value=True), mock.patch.object(
+            self.service, "_mcp_preflight", return_value={"status": "FAILED", "code": "MCP_CATALOG_MISMATCH"}
+        ):
+            self.assertFalse(supervisor._wait_gateway_ready(timeout=0.1))
+        with mock.patch.object(supervisor, "_wait_gateway", return_value=True), mock.patch.object(
+            self.service, "_mcp_preflight", return_value={"status": "READY"}
+        ):
+            self.assertTrue(supervisor._wait_gateway_ready(timeout=0.1))
+
+    def test_gateway_restart_holds_tunnel_until_gateway_is_ready(self):
+        cfg = self.service.ServiceConfig("tunnel_x", [self.ws.id], tunnel_client=str(self.tunnel))
+        supervisor = self.service.ServiceSupervisor(cfg)
+        gateway = self.service._Child("gateway", [], state="BACKOFF")
+        tunnel = self.service._Child("tunnel", [], state="RUNNING")
+        tunnel.process = object()
+        supervisor.children = {"gateway": gateway, "tunnel": tunnel}
+        spawned = []
+
+        def spawn(child):
+            spawned.append(child.name)
+            child.process = object()
+
+        with mock.patch.object(supervisor, "_spawn", side_effect=spawn), mock.patch.object(supervisor, "_terminate"), mock.patch.object(
+            supervisor, "_wait_gateway_ready", return_value=False
+        ), mock.patch.object(supervisor, "_persist"):
+            supervisor._restart_child(gateway)
+        self.assertEqual(spawned, ["gateway"])
+        self.assertEqual(tunnel.state, "BACKOFF")
+        self.assertIsNone(tunnel.process)
+        self.assertEqual(tunnel.next_restart, float("inf"))
+        self.assertEqual(gateway.state, "BACKOFF")
+
+        gateway.process = None
+        with mock.patch.object(supervisor, "_spawn", side_effect=spawn), mock.patch.object(
+            supervisor, "_wait_gateway_ready", return_value=True
+        ), mock.patch.object(supervisor, "_persist"):
+            supervisor._restart_child(gateway)
+        self.assertEqual(gateway.state, "RUNNING")
+        self.assertEqual(tunnel.next_restart, 0.0)
+        self.assertEqual(spawned, ["gateway", "gateway"])
+
+        with mock.patch.object(supervisor, "_spawn", side_effect=spawn), mock.patch.object(
+            supervisor, "_wait_tunnel", return_value=True
+        ), mock.patch.object(supervisor, "_persist"):
+            supervisor._restart_child(tunnel)
+        self.assertEqual(tunnel.state, "RUNNING")
+        self.assertEqual(spawned, ["gateway", "gateway", "tunnel"])
+
     def test_tunnel_readiness_timeout_logs_bounded_probe_reason(self):
         os.environ["chatgpt-apikey"] = "probe-secret-value"
         cfg = self.service.ServiceConfig("tunnel_x", [self.ws.id], tunnel_client=str(self.tunnel))

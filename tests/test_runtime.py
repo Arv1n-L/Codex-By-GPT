@@ -175,7 +175,7 @@ class RuntimeTest(unittest.TestCase):
 
         tools = copy.deepcopy(list(self.runtime.EXPECTED_MCP_TOOLS.values()))
         responses = [
-            Response({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18", "serverInfo": {"name": "codex-by-gpt-gateway", "version": "0.2.2"}}}),
+            Response({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18", "serverInfo": {"name": "codex-by-gpt-gateway", "version": "0.2.3"}}}),
             Response({"jsonrpc": "2.0", "id": 2, "result": {"tools": tools}}),
             Response({"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": json.dumps({"workspaces": [{"workspaceId": self.ws.id}]})} ]}}),
         ]
@@ -183,6 +183,8 @@ class RuntimeTest(unittest.TestCase):
             result = self.runtime._mcp_preflight()
         self.assertEqual(result["status"], "READY")
         self.assertEqual(result["workspaceCount"], 1)
+        self.assertEqual(result["mcpCatalogDigest"], self.runtime.MCP_CATALOG_DIGEST)
+        self.assertEqual(result["expectedCatalogDigest"], self.runtime.MCP_CATALOG_DIGEST)
         self.assertEqual(urlopen.call_count, 3)
 
     def test_mcp_preflight_rejects_catalog_schema_drift(self):
@@ -195,13 +197,47 @@ class RuntimeTest(unittest.TestCase):
         tools = copy.deepcopy(list(self.runtime.EXPECTED_MCP_TOOLS.values()))
         tools[0]["annotations"] = {"readOnlyHint": False}
         responses = [
-            Response({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18", "serverInfo": {"name": "codex-by-gpt-gateway", "version": "0.2.2"}}}),
+            Response({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18", "serverInfo": {"name": "codex-by-gpt-gateway", "version": "0.2.3"}}}),
             Response({"jsonrpc": "2.0", "id": 2, "result": {"tools": tools}}),
         ]
         with mock.patch.object(self.runtime.urllib.request, "urlopen", side_effect=responses):
             result = self.runtime._mcp_preflight()
         self.assertEqual(result["code"], "MCP_CATALOG_INVALID")
         self.assertIn("workspace_list", result["invalid"])
+        self.assertEqual(result["expectedCatalogDigest"], self.runtime.MCP_CATALOG_DIGEST)
+        self.assertNotEqual(result["actualCatalogDigest"], result["expectedCatalogDigest"])
+
+    def test_mcp_preflight_rejects_digest_only_catalog_drift(self):
+        class Response:
+            def __init__(self, payload): self.payload = payload
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return json.dumps(self.payload).encode("utf-8")
+
+        tools = copy.deepcopy(list(self.runtime.EXPECTED_MCP_TOOLS.values()))
+        tools[0]["description"] = "changed public description"
+        responses = [
+            Response({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18", "serverInfo": {"name": "codex-by-gpt-gateway", "version": "0.2.3"}}}),
+            Response({"jsonrpc": "2.0", "id": 2, "result": {"tools": tools}}),
+        ]
+        with mock.patch.object(self.runtime.urllib.request, "urlopen", side_effect=responses):
+            result = self.runtime._mcp_preflight()
+        self.assertEqual(result["code"], "MCP_CATALOG_MISMATCH")
+        self.assertNotEqual(result["expectedCatalogDigest"], result["actualCatalogDigest"])
+
+    def test_doctor_distinguishes_local_ready_from_client_snapshot(self):
+        status = {
+            "version": "0.2.3",
+            "gateway": {"status": "HEALTHY", "endpoint": "http://127.0.0.1:8765", "server": {"version": "0.2.3"}},
+            "tunnel": {"status": "READY", "profile": "codex-by-gpt", "healthUrl": "http://127.0.0.1:8080", "executable": "C:/tunnel-client.exe"},
+            "mcpPreflight": {"status": "READY", "mcpCatalogDigest": "digest"},
+            "state": {}, "workspaces": [],
+        }
+        with mock.patch.object(self.runtime.shutil, "which", return_value="git"):
+            issues = self.runtime.diagnose(status)
+        codes = {issue["code"] for issue in issues}
+        self.assertIn("LOCAL_MCP_READY", codes)
+        self.assertIn("CLIENT_ACTIONS_UNVERIFIED", codes)
 
     def test_mcp_preflight_reports_incomplete_action_set(self):
         class Response:
@@ -216,7 +252,7 @@ class RuntimeTest(unittest.TestCase):
                 return json.dumps(self.payload).encode("utf-8")
 
         responses = [
-            Response({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18", "serverInfo": {"name": "codex-by-gpt-gateway", "version": "0.2.2"}}}),
+            Response({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18", "serverInfo": {"name": "codex-by-gpt-gateway", "version": "0.2.3"}}}),
             Response({"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "workspace_list"}]}}),
         ]
         with mock.patch.object(self.runtime.urllib.request, "urlopen", side_effect=responses):
@@ -261,8 +297,8 @@ class RuntimeTest(unittest.TestCase):
     def test_doctor_treats_stopped_or_unready_tunnel_as_error(self):
         for tunnel_status in ("STOPPED", "STARTING", "NOT_READY"):
             status = {
-                "version": "0.2.2",
-                "gateway": {"status": "HEALTHY", "endpoint": "http://127.0.0.1:8765", "server": {"version": "0.2.2"}},
+                "version": "0.2.3",
+                "gateway": {"status": "HEALTHY", "endpoint": "http://127.0.0.1:8765", "server": {"version": "0.2.3"}},
                 "tunnel": {"status": tunnel_status, "profile": "codex-by-gpt", "healthUrl": "http://127.0.0.1:8080", "executable": "C:/tunnel-client.exe"},
                 "state": {},
                 "workspaces": [],
